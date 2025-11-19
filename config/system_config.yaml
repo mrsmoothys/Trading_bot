@@ -1,0 +1,90 @@
+# DeepSeek Integrated Trading System Configuration
+
+# Memory Management
+memory:
+  limit_mb: 4000
+  feature_cache_ttl: 300  # 5 minutes
+  max_trade_history: 1000
+  max_conversation_memory: 100
+  max_historical_days: 30
+
+# Risk Management
+risk:
+  max_position_size: 0.05  # 5% per position
+  max_total_exposure: 0.20  # 20% total exposure
+  max_drawdown_limit: 0.10  # 10% drawdown
+  stop_loss_atr_multiplier: 2.0
+  trailing_stop_distance: 1.5
+
+# Trading Parameters
+trading:
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - ADAUSDT
+    - SOLUSDT
+    - DOTUSDT
+    - MATICUSDT
+    - LINKUSDT
+    - LTCUSDT
+    - BCHUSDT
+    - XRPUSDT
+  timeframes:
+    - 5m
+    - 15m
+    - 1h
+    - 4h
+    - 1d
+  base_position_size: 0.02  # 2% base
+  confidence_threshold: 0.60  # Minimum 60% confidence
+
+# Feature Engineering
+features:
+  liquidity_zones:
+    lookback_periods: 100
+    price_bins: 50
+    volume_threshold_percentile: 95
+  order_flow:
+    imbalance_period: 20
+  chandelier_exit:
+    period: 22
+    multiplier: 3
+  supertrend:
+    atr_period: 10
+    multiplier: 3
+  market_regime:
+    period: 50
+    trend_threshold: 0.1
+
+# Performance Monitoring
+performance:
+  check_interval_seconds: 60
+  memory_warning_threshold: 3500  # MB
+  cpu_warning_threshold: 80  # percent
+
+# API Configuration
+api:
+  deepseek:
+    max_retries: 3
+    timeout_seconds: 2
+    model: deepseek-chat
+    max_tokens: 4000
+    temperature: 0.7
+  binance:
+    rate_limit_interval: 60  # seconds
+    testnet: true
+
+# Dashboard Configuration
+dashboard:
+  port: 8050
+  host: 0.0.0.0
+  debug: false
+  auto_refresh_interval: 5  # seconds
+
+# Logging
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/deepseek_trader.log"
+  max_file_size_mb: 100
+  backup_count: 5

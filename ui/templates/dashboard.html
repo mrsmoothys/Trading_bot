@@ -1,0 +1,268 @@
+{% extends "base.html" %}
+
+{% block title %}DeepSeek Trading Dashboard{% endblock %}
+
+{% block nav-controls %}
+<div class="nav-controls-group">
+    <!-- Symbol Selector -->
+    <div class="symbol-selector">
+        <label for="symbol-select">Symbol:</label>
+        <select id="symbol-select" class="symbol-dropdown">
+            <option value="BTCUSDT" selected>BTC/USDT</option>
+            <option value="ETHUSDT">ETH/USDT</option>
+            <option value="ADAUSDT">ADA/USDT</option>
+            <option value="SOLUSDT">SOL/USDT</option>
+        </select>
+    </div>
+
+    <!-- Timeframe Selector -->
+    <div class="timeframe-selector">
+        <button class="timeframe-btn" data-tf="1m">1m</button>
+        <button class="timeframe-btn" data-tf="5m">5m</button>
+        <button class="timeframe-btn active" data-tf="15m">15m</button>
+        <button class="timeframe-btn" data-tf="1h">1h</button>
+        <button class="timeframe-btn" data-tf="4h">4h</button>
+        <button class="timeframe-btn" data-tf="1d">1d</button>
+    </div>
+
+    <!-- Status Indicator -->
+    <div class="status-indicator">
+        <span class="status-dot"></span>
+        <span class="status-text">Live</span>
+    </div>
+</div>
+{% endblock %}
+
+{% block chart-area %}
+<!-- Dash Application Container -->
+<div id="dash-app" class="dash-container">
+    <!-- The Dash app will be mounted here -->
+    {% block dash-content %}{% endblock %}
+</div>
+
+<!-- Chart Overlay Controls -->
+<div class="chart-controls">
+    <div class="control-section">
+        <h3 class="control-title">Chart Overlays</h3>
+
+        <div class="toggle-group">
+            <label class="toggle-item">
+                <input type="checkbox" id="toggle-liquidity" class="toggle-input" checked>
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">Liquidity Zones</span>
+            </label>
+
+            <label class="toggle-item">
+                <input type="checkbox" id="toggle-supertrend" class="toggle-input" checked>
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">Supertrend</span>
+            </label>
+
+            <label class="toggle-item">
+                <input type="checkbox" id="toggle-chandelier" class="toggle-input">
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">Chandelier Exit</span>
+            </label>
+
+            <label class="toggle-item">
+                <input type="checkbox" id="toggle-orderflow" class="toggle-input">
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">Order Flow</span>
+            </label>
+
+            <label class="toggle-item">
+                <input type="checkbox" id="toggle-regime" class="toggle-input">
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">Market Regime</span>
+            </label>
+
+            <label class="toggle-item">
+                <input type="checkbox" id="toggle-timeframe" class="toggle-input">
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">Timeframe Alignment</span>
+            </label>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block side-panel %}
+<div class="side-panel-content">
+    <!-- Feature Snapshot Card -->
+    <div class="snapshot-card">
+        <div class="card-header">
+            <h3 class="card-title">Market Snapshot</h3>
+            <span class="card-badge">Live</span>
+        </div>
+        <div class="snapshot-data">
+            <div class="snapshot-row">
+                <span class="snapshot-label">Price:</span>
+                <span class="snapshot-value price-up">$43,250.50</span>
+            </div>
+            <div class="snapshot-row">
+                <span class="snapshot-label">24h Change:</span>
+                <span class="snapshot-value change-positive">+2.45%</span>
+            </div>
+            <div class="snapshot-row">
+                <span class="snapshot-label">Volume:</span>
+                <span class="snapshot-value">$1.2B</span>
+            </div>
+            <div class="snapshot-row">
+                <span class="snapshot-label">RSI (14):</span>
+                <span class="snapshot-value">58.3</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chat Interface -->
+    <div class="chat-container">
+        <div class="chat-header">
+            <h3 class="chat-title">DeepSeek Assistant</h3>
+            <div class="chat-actions">
+                <button class="chat-action-btn" title="Clear Chat">🗑</button>
+                <button class="chat-action-btn" title="Settings">⚙</button>
+            </div>
+        </div>
+
+        <div class="chat-history" id="chat-history">
+            <!-- Chat messages will be populated here -->
+            <div class="chat-message ai-message">
+                <div class="message-avatar">🤖</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-author">DeepSeek</span>
+                        <span class="message-time">10:30</span>
+                    </div>
+                    <div class="message-text">
+                        Ready to analyze market conditions. Ask me about trends, signals, or overlay features.
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="chat-input-container">
+            <input
+                type="text"
+                class="chat-input"
+                id="chat-input"
+                placeholder="Ask DeepSeek about market conditions..."
+                autocomplete="off"
+            >
+            <button class="chat-send-btn" id="chat-send">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                    <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Quick Actions -->
+    <div class="quick-actions">
+        <h3 class="actions-title">Quick Actions</h3>
+        <div class="actions-grid">
+            <button class="action-btn">
+                <span class="action-icon">📊</span>
+                <span class="action-text">Analyze Trend</span>
+            </button>
+            <button class="action-btn">
+                <span class="action-icon">🔍</span>
+                <span class="action-text">Find Signals</span>
+            </button>
+            <button class="action-btn">
+                <span class="action-icon">💰</span>
+                <span class="action-text">Check Liquidity</span>
+            </button>
+            <button class="action-btn">
+                <span class="action-icon">⚡</span>
+                <span class="action-text">Market Scan</span>
+            </button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+
+<!-- Chart-Specific JavaScript -->
+<script>
+    // Timeframe switching
+    document.querySelectorAll('.timeframe-btn').forEach(btn => {
+        btn.addEventListener('click', function() {
+            document.querySelectorAll('.timeframe-btn').forEach(b => b.classList.remove('active'));
+            this.classList.add('active');
+            // Trigger Dash callback
+            // This would typically be handled by Dash's callbacks
+        });
+    });
+
+    // Symbol selection
+    document.getElementById('symbol-select').addEventListener('change', function() {
+        console.log('Symbol changed to:', this.value);
+        // Trigger Dash callback
+    });
+
+    // Chart overlay toggles
+    document.querySelectorAll('.toggle-input').forEach(toggle => {
+        toggle.addEventListener('change', function() {
+            const overlayName = this.id.replace('toggle-', '');
+            console.log(`Overlay ${overlayName}:`, this.checked ? 'ON' : 'OFF');
+            // Trigger Dash callback to update chart
+        });
+    });
+
+    // Chat functionality
+    const chatInput = document.getElementById('chat-input');
+    const chatSend = document.getElementById('chat-send');
+    const chatHistory = document.getElementById('chat-history');
+
+    function sendMessage() {
+        const message = chatInput.value.trim();
+        if (!message) return;
+
+        // Add user message to chat
+        addChatMessage('user', message);
+        chatInput.value = '';
+
+        // Simulate AI response (in real implementation, this would call DeepSeek)
+        setTimeout(() => {
+            addChatMessage('ai', 'Analyzing your request: ' + message);
+        }, 1000);
+    }
+
+    function addChatMessage(sender, text) {
+        const messageEl = document.createElement('div');
+        messageEl.className = `chat-message ${sender}-message`;
+
+        const avatar = sender === 'ai' ? '🤖' : '👤';
+        const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+        messageEl.innerHTML = `
+            <div class="message-avatar">${avatar}</div>
+            <div class="message-content">
+                <div class="message-header">
+                    <span class="message-author">${sender === 'ai' ? 'DeepSeek' : 'You'}</span>
+                    <span class="message-time">${time}</span>
+                </div>
+                <div class="message-text">${text}</div>
+            </div>
+        `;
+
+        chatHistory.appendChild(messageEl);
+        chatHistory.scrollTop = chatHistory.scrollHeight;
+    }
+
+    chatSend.addEventListener('click', sendMessage);
+    chatInput.addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') {
+            sendMessage();
+        }
+    });
+
+    // Status indicator animation
+    const statusDot = document.querySelector('.status-dot');
+    setInterval(() => {
+        statusDot.style.opacity = statusDot.style.opacity === '1' ? '0.5' : '1';
+    }, 1000);
+</script>
+{% endblock %}

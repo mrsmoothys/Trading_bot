@@ -1,0 +1,14 @@
+--- Page 1 ---
+name: deepseek-trader channels:   - conda-forge   - pytorch   - defaults dependencies:   # Python version   - python=3.10      # Core data processing (ARM-optimized)   - pandas=2.1   - numpy=1.26   - pyarrow=14   - polars=0.19      # Machine learning   - scikit-learn=1.3   - lightgbm=4.1   - optuna=3.4      # M1 Acceleration   - pytorch=2.1   - torchvision   - torchaudio      # Numerical optimization 
+--- Page 2 ---
+  - scipy=1.11   - numba=0.58   - bottleneck=1.3      # Trading APIs   - ccxt=4.1   - websockets=12.0      # Web framework   - ﬂask=3.0      # Visualization   - plotly=5.18   - rich=13.7      # System monitoring   - psutil=5.9      # Development tools   - pytest=7.4   - black=23.12   - ruX=0.1   - mypy=1.7      # Database   - sqlalchemy=2.0 
+--- Page 3 ---
+     # Utilities   - python-dotenv=1.0   - pydantic=2.5   - pyyaml=6.0   - schedule=1.2   - tqdm=4.66   - click=8.1   - pytz=2023.3   - python-dateutil=2.8      # Pip packages (not available via conda or need speciﬁc versions)   - pip   - pip:     - python-binance==1.0.19     - loguru==0.7.2     - aiohttp==3.9.0     - openai==1.3.0     - dash==2.14.0     - dash-bootstrap-components==1.5.0     - ﬂask-socketio==5.3.0     - redis==5.0.1     - gpustat==1.0.0     - hypothesis==6.92.0     - pre-commit==3.5.0 # Core Data Processing 
+--- Page 4 ---
+pandas>=2.1.0 numpy>=1.26.0 pyarrow>=14.0.0 polars>=0.19.0  # API & Web Communication requests>=2.31.0 aiohttp>=3.9.0 websockets>=12.0 ﬂask>=3.0.0 ﬂask-socketio>=5.3.0  # Trading & Market Data ccxt>=4.1.0 python-binance>=1.0.19  # AI Integration openai>=1.3.0  # Machine Learning scikit-learn>=1.3.0 lightgbm>=4.1.0 optuna>=3.4.0  # M1 Acceleration torch>=2.1.0 
+--- Page 5 ---
+torchvision>=0.16.0 torchaudio>=2.1.0  # Numerical Computing scipy>=1.11.0 numba>=0.58.0 bottleneck>=1.3.0  # Database & Storage sqlalchemy>=2.0.23 redis>=5.0.1  # Conﬁguration python-dotenv>=1.0.0 pydantic>=2.5.0 pyyaml>=6.0  # Visualization & Dashboard plotly>=5.18.0 dash>=2.14.0 dash-bootstrap-components>=1.5.0 rich>=13.7.0  # System Monitoring psutil>=5.9.0 gpustat>=1.0.0 
+--- Page 6 ---
+ # Development & Testing pytest>=7.4.0 pytest-asyncio>=0.21.0 pytest-cov>=4.1.0 hypothesis>=6.92.0 black>=23.12.0 ruX>=0.1.0 mypy>=1.7.0 pre-commit>=3.5.0  # Utilities schedule>=1.2.0 tqdm>=4.66.0 loguru>=0.7.0 click>=8.1.0 pytz>=2023.3 python-dateutil>=2.8.2  # Technical Analysis ta-lib>=0.4.28 tulipy>=0.4.0  # Portfolio Optimization riskfolio-lib>=4.1.0 empyrical>=0.5.0 
+--- Page 7 ---
+ # Sentiment Analysis textblob>=0.17.1 vaderSentiment>=3.3.2 transformers>=4.35.0  # Blockchain & On-chain web3>=6.0.0  # Alternative ML Models xgboost>=2.0.0 catboost>=1.2.0  
