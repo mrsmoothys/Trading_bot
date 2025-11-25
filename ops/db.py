@@ -101,6 +101,62 @@ class SignalRecord(Base):
         }
 
 
+class ActivePosition(Base):
+    """Active position database record."""
+    __tablename__ = 'active_positions'
+
+    # Primary key
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Position data
+    symbol = Column(String(20), nullable=False, index=True)
+    side = Column(String(10), nullable=False)  # 'LONG' or 'SHORT'
+    entry_price = Column(Float, nullable=False)
+    quantity = Column(Float, nullable=False)
+    leverage = Column(Float, nullable=False, default=1.0)
+
+    # P&L
+    unrealized_pnl = Column(Float, nullable=False, default=0.0)
+    value = Column(Float, nullable=False, default=0.0)  # Position value in quote currency
+
+    # Timing
+    entry_time = Column(DateTime, nullable=False, index=True)
+    last_updated = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # Strategy data
+    confidence = Column(Float, nullable=False, default=0.0)
+    reasoning = Column(Text, nullable=True)
+    strategy = Column(String(50), nullable=True)
+
+    # Risk management
+    stop_loss = Column(Float, nullable=True)
+    take_profit = Column(Float, nullable=True)
+
+    # Metadata
+    source = Column(String(50), nullable=True)  # e.g., 'convergence', 'manual'
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert database record to dictionary."""
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'side': self.side,
+            'entry_price': self.entry_price,
+            'quantity': self.quantity,
+            'leverage': self.leverage,
+            'unrealized_pnl': self.unrealized_pnl,
+            'value': self.value,
+            'entry_time': self.entry_time.isoformat() if self.entry_time else None,
+            'last_updated': self.last_updated.isoformat() if self.last_updated else None,
+            'confidence': self.confidence,
+            'reasoning': self.reasoning,
+            'strategy': self.strategy,
+            'stop_loss': self.stop_loss,
+            'take_profit': self.take_profit,
+            'source': self.source,
+        }
+
+
 class DatabaseManager:
     """
     Database manager for signal persistence.
@@ -445,6 +501,165 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error deleting old signals: {e}")
             return 0
+
+    async def save_active_position(self, position: Dict[str, Any]) -> int:
+        """
+        Save active position to database.
+
+        Args:
+            position: Position dictionary to save
+
+        Returns:
+            ID of saved position
+        """
+        try:
+            # Check if position already exists
+            existing_id = position.get('id')
+            if existing_id:
+                # Update existing position
+                with self.get_session() as session:
+                    record = session.query(ActivePosition).filter(ActivePosition.id == existing_id).first()
+                    if record:
+                        # Update fields
+                        record.unrealized_pnl = float(position.get('unrealized_pnl', 0.0))
+                        record.value = float(position.get('value', 0.0))
+                        record.last_updated = datetime.now()
+                        logger.info(f"Updated active position {existing_id} in database")
+                        return existing_id
+
+            # Create new position
+            record = ActivePosition(
+                symbol=position.get('symbol', ''),
+                side=position.get('side', 'LONG'),
+                entry_price=float(position.get('entry_price', 0.0)),
+                quantity=float(position.get('quantity', 0.0)),
+                leverage=float(position.get('leverage', 1.0)),
+                unrealized_pnl=float(position.get('unrealized_pnl', 0.0)),
+                value=float(position.get('value', 0.0)),
+                entry_time=datetime.fromisoformat(position.get('entry_time', datetime.now().isoformat())),
+                confidence=float(position.get('confidence', 0.0)),
+                reasoning=position.get('reasoning', ''),
+                strategy=position.get('strategy'),
+                stop_loss=position.get('stop_loss'),
+                take_profit=position.get('take_profit'),
+                source=position.get('source'),
+            )
+
+            with self.get_session() as session:
+                session.add(record)
+                session.flush()
+                position_id = record.id
+
+            logger.info(f"Active position saved to database (ID: {position_id}, {position['symbol']})")
+            return position_id
+
+        except Exception as e:
+            logger.error(f"Error saving active position to database: {e}")
+            raise
+
+    async def get_active_positions(self) -> List[Dict[str, Any]]:
+        """
+        Get all active positions from database.
+
+        Returns:
+            List of active position dictionaries
+        """
+        try:
+            with self.get_session() as session:
+                records = session.query(ActivePosition).all()
+                return [record.to_dict() for record in records]
+        except Exception as e:
+            logger.error(f"Error retrieving active positions: {e}")
+            return []
+
+    async def get_active_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Get active position for a specific symbol.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            Active position dictionary or None
+        """
+        try:
+            with self.get_session() as session:
+                record = session.query(ActivePosition).filter(
+                    ActivePosition.symbol == symbol
+                ).first()
+                if record:
+                    return record.to_dict()
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving active position for {symbol}: {e}")
+            return None
+
+    async def close_position(self, symbol: str, exit_data: Dict[str, Any]) -> bool:
+        """
+        Close position by removing from active_positions and logging to trade history.
+
+        Args:
+            symbol: Trading symbol
+            exit_data: Exit data dictionary
+
+        Returns:
+            Success status
+        """
+        try:
+            with self.get_session() as session:
+                record = session.query(ActivePosition).filter(
+                    ActivePosition.symbol == symbol
+                ).first()
+
+                if record:
+                    # Log the trade to signals table (as completed trade)
+                    logger.info(f"Closing position for {symbol}, PnL: {exit_data.get('pnl', 0.0)}")
+                    # Delete from active_positions
+                    session.delete(record)
+                    logger.info(f"Removed active position {symbol} from database")
+                    return True
+                return False
+        except Exception as e:
+            logger.error(f"Error closing position for {symbol}: {e}")
+            return False
+
+    async def reconcile_with_binance(self, binance_positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Reconcile database active positions with Binance positions.
+
+        Args:
+            binance_positions: List of positions from Binance API
+
+        Returns:
+            Reconciliation report
+        """
+        try:
+            db_positions = await self.get_active_positions()
+            db_symbols = {p['symbol'] for p in db_positions}
+            binance_symbols = {p['symbol'] for p in binance_positions}
+
+            # Find discrepancies
+            missing_in_db = binance_symbols - db_symbols
+            extra_in_db = db_symbols - binance_symbols
+            common = db_symbols & binance_symbols
+
+            reconciliation_report = {
+                'db_count': len(db_positions),
+                'binance_count': len(binance_positions),
+                'missing_in_db': list(missing_in_db),
+                'extra_in_db': list(extra_in_db),
+                'in_sync': len(missing_in_db) == 0 and len(extra_in_db) == 0,
+            }
+
+            logger.info(f"Position reconciliation: DB={len(db_positions)}, Binance={len(binance_positions)}")
+            logger.info(f"  Missing in DB: {missing_in_db}")
+            logger.info(f"  Extra in DB: {extra_in_db}")
+
+            return reconciliation_report
+
+        except Exception as e:
+            logger.error(f"Error reconciling positions with Binance: {e}")
+            return {'error': str(e)}
 
     async def close(self):
         """Close database connections."""

@@ -5,6 +5,7 @@ AI-enhanced with DeepSeek integration for intelligent risk assessment.
 """
 
 import asyncio
+import os
 from datetime import datetime
 from typing import Dict, Any, List
 import numpy as np
@@ -46,8 +47,15 @@ class RiskManager:
         # AI-enhanced risk assessment
         self.use_ai_risk_assessment = self.deepseek is not None
 
+        # AI Circuit Breaker (Step 6)
+        self.ai_failure_count = 0
+        self.ai_failure_threshold = int(os.getenv('AI_FAILURE_THRESHOLD', '3'))
+        self.technical_fallback_mode = False
+        self.last_ai_success_time = None
+
         logger.info(f"RiskManager initialized - AI Risk Assessment: {self.use_ai_risk_assessment}")
         logger.info(f"Convergence Strategy Integration: {self.enable_convergence_stops}")
+        logger.info(f"AI Circuit Breaker: {self.ai_failure_threshold} failures before fallback")
 
     async def validate_trade(
         self,
@@ -163,7 +171,8 @@ class RiskManager:
 
             # All checks passed - proceed to AI assessment if available
             ai_assessment = None
-            if self.use_ai_risk_assessment:
+            if self.use_ai_risk_assessment and not self.technical_fallback_mode:
+                # Normal mode: use AI assessment (Step 6: Circuit Breaker)
                 try:
                     ai_assessment = await self._assess_trade_with_ai(signal, proposed_size)
                     if ai_assessment and not ai_assessment.get('approved', True):
@@ -181,6 +190,11 @@ class RiskManager:
             if ai_assessment:
                 result["ai_assessment"] = ai_assessment
                 result["ai_enhanced"] = True
+            elif self.technical_fallback_mode:
+                # In fallback mode, show technical-only validation
+                result["ai_enhanced"] = False
+                result["fallback_mode"] = True
+                result["reason"] = "All risk checks passed (technical validation only - AI in fallback mode)"
 
             return result
 
@@ -607,6 +621,11 @@ class RiskManager:
             # Query DeepSeek for risk assessment
             assessment = await self.deepseek.assess_risk(risk_context)
 
+            # Track AI success (Step 6: AI Circuit Breaker)
+            self.ai_failure_count = 0
+            self.technical_fallback_mode = False
+            self.last_ai_success_time = datetime.now()
+
             # Log AI assessment
             if assessment.get('approved'):
                 logger.info(
@@ -622,11 +641,24 @@ class RiskManager:
             return assessment
 
         except Exception as e:
-            logger.error(f"Error in AI risk assessment: {e}")
+            # Track AI failure (Step 6: AI Circuit Breaker)
+            self.ai_failure_count += 1
+            error_msg = str(e)
+
+            logger.error(f"AI risk assessment failed (failure {self.ai_failure_count}/{self.ai_failure_threshold}): {error_msg}")
+
+            # Check if we should enter fallback mode
+            if self.ai_failure_count >= self.ai_failure_threshold and not self.technical_fallback_mode:
+                self.technical_fallback_mode = True
+                logger.warning(
+                    f"⚠️  ENTERING AI FALLBACK MODE: {self.ai_failure_threshold} consecutive AI failures detected. "
+                    f"Switching to technical-only risk validation."
+                )
+
             # Fail-safe: reject the trade if AI assessment fails
             return {
                 "approved": False,
-                "reason": f"AI assessment error: {str(e)}",
+                "reason": f"AI assessment error: {error_msg}",
                 "risk_score": 1.0,
                 "adjusted_size": 0
             }

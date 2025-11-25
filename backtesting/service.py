@@ -135,7 +135,7 @@ class BacktestResult:
             total_return=results.total_return,
             total_return_pct=results.total_return * 100,
             annualized_return=results.annualized_return,
-            max_drawdown=results.max_drawdown,
+            max_drawdown=results.max_drawdown.item() if isinstance(results.max_drawdown, (pd.Series, pd.DataFrame)) else float(results.max_drawdown),
             sharpe_ratio=results.sharpe_ratio,
             win_rate=results.win_rate,
             profit_factor=results.profit_factor,
@@ -196,8 +196,13 @@ def generate_signals(df: pd.DataFrame, strategy: str, params: Dict[str, Any]) ->
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
+
+        # Fix: Avoid division by zero and handle small values
+        rs = gain / (loss + 1e-10)  # Add small epsilon to prevent division by zero
+        rs = rs.replace([np.inf, -np.inf], 0).fillna(0)  # Replace inf and NaN with 0
+
         rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.replace([np.inf, -np.inf], 50).fillna(50)  # Replace inf/NaN with neutral 50
 
         # Generate signals
         signals.loc[rsi < oversold, 'signal'] = 1  # Oversold - buy
@@ -236,7 +241,7 @@ def generate_signals(df: pd.DataFrame, strategy: str, params: Dict[str, Any]) ->
         histogram_trend = histogram.rolling(3).apply(lambda x: len(set(np.sign(x))) == 1).fillna(0)
         signals['confidence'] = histogram_trend
 
-    elif strategy == 'convergence':
+    elif strategy in ['convergence', 'scalp_15m_4h']:
         # Multi-timeframe convergence strategy (simplified)
         # In production, this would call the actual convergence system
 
@@ -245,14 +250,67 @@ def generate_signals(df: pd.DataFrame, strategy: str, params: Dict[str, Any]) ->
         ema_slow = df['close'].ewm(span=21).mean()
         trend = np.where(ema_fast > ema_slow, 1, -1)
 
-        # Calculate volatility
-        returns = df['close'].pct_change()
-        volatility = returns.rolling(20).std()
+        # Calculate volatility with bounds checking
+        returns = df['close'].pct_change(fill_method=None).fillna(0)
+        returns = returns.replace([np.inf, -np.inf], 0)  # Replace inf with 0
+        volatility = returns.rolling(20).std().fillna(0)
 
         # Generate signals based on trend with volatility filter
         signals['signal'] = trend
         signals['strength'] = volatility.fillna(0)
         signals['confidence'] = 0.7  # High confidence for convergence signals
+
+    elif strategy == 'ma_crossover':
+        # Moving Average Crossover
+        try:
+            from core.strategies.ma_crossover import calculate_signals as ma_calc
+            signals = ma_calc(df, params)
+        except Exception as e:
+            logger.warning(f"Could not use ma_crossover strategy, using fallback: {e}")
+            # Fallback to simple SMA crossover
+            fast_period = params.get('fast_period', 20)
+            slow_period = params.get('slow_period', 50)
+
+            sma_fast = df['close'].rolling(fast_period).mean()
+            sma_slow = df['close'].rolling(slow_period).mean()
+
+            signals = pd.DataFrame(index=df.index)
+            signals['signal'] = 0.0
+            signals['strength'] = 0.0
+            signals['confidence'] = 0.5
+
+            signals.loc[sma_fast > sma_slow, 'signal'] = 1
+            signals.loc[sma_fast < sma_slow, 'signal'] = -1
+
+    elif strategy == 'rsi_divergence':
+        # RSI Divergence
+        try:
+            from core.strategies.rsi_divergence import calculate_signals as rsi_calc
+            signals = rsi_calc(df, params)
+        except Exception as e:
+            logger.warning(f"Could not use rsi_divergence strategy, using fallback: {e}")
+            # Fallback to simple RSI
+            period = params.get('period', 14)
+            oversold = params.get('oversold', 30)
+            overbought = params.get('overbought', 70)
+
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+            rs = gain / (loss + 1e-10)
+            rs = rs.replace([np.inf, -np.inf], 0).fillna(0)
+
+            rsi = 100 - (100 / (1 + rs))
+            rsi = rsi.replace([np.inf, -np.inf], 50).fillna(50)
+
+            signals = pd.DataFrame(index=df.index)
+            signals['signal'] = 0.0
+            signals['strength'] = 0.0
+            signals['confidence'] = 0.5
+
+            signals.loc[rsi < oversold, 'signal'] = 1
+            signals.loc[rsi > overbought, 'signal'] = -1
 
     else:
         logger.warning(f"Unknown strategy: {strategy}, using passive strategy")
@@ -277,6 +335,18 @@ def load_market_data(symbol: str, timeframe: str, start: datetime, end: datetime
     Returns:
         DataFrame with OHLCV data
     """
+    # Cap bars per timeframe to keep sweeps responsive
+    MAX_BARS = {
+        '1m': 1500,
+        '5m': 2500,
+        '15m': 4000,
+        '30m': 5000,
+        '1h': 6000,
+        '4h': 7000,
+        '1d': 3000,
+        '1w': 2000
+    }
+
     try:
         # Try to load from cache/parquet first
         from ui.dashboard import fetch_market_data
@@ -291,6 +361,8 @@ def load_market_data(symbol: str, timeframe: str, start: datetime, end: datetime
         minutes = timeframe_minutes.get(timeframe, 60)
         total_minutes = (end - start).total_seconds() / 60
         num_bars = int(total_minutes / minutes) + 100  # Extra bars for warmup
+        max_bars = MAX_BARS.get(timeframe, 8000)
+        num_bars = max(500, min(num_bars, max_bars))
 
         # Fetch data
         df, meta = fetch_market_data(symbol, timeframe, num_bars=num_bars, force_refresh=True)
@@ -301,6 +373,14 @@ def load_market_data(symbol: str, timeframe: str, start: datetime, end: datetime
         # Filter by date range
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.set_index('timestamp')
+
+        # Ensure timezone compatibility
+        if df.index.tz is not None:
+            # DataFrame has timezone, localize start/end if they're naive
+            if start.tzinfo is None:
+                start = start.tz_localize('UTC')
+            if end.tzinfo is None:
+                end = end.tz_localize('UTC')
 
         # Filter data
         mask = (df.index >= start) & (df.index <= end)
@@ -333,11 +413,20 @@ def load_market_data(symbol: str, timeframe: str, start: datetime, end: datetime
 
         # Generate random walk with slight upward trend
         price = 50000  # Starting price (like BTC)
-        returns = np.random.normal(0.001, 0.02, num_bars)  # Daily returns
+        # Clamp returns to prevent extreme outliers
+        returns = np.random.normal(0.001, 0.02, num_bars)
+        returns = np.clip(returns, -0.1, 0.1)  # Cap at ±10% per bar
         prices = [price]
 
+        # Fix: Add bounds checking to prevent infinity from compounding
         for ret in returns[1:]:
-            prices.append(prices[-1] * (1 + ret))
+            new_price = prices[-1] * (1 + ret)
+            # Cap price to prevent overflow to infinity
+            if not np.isfinite(new_price) or new_price <= 0:
+                new_price = prices[-1]  # Use previous price
+            # Cap at much tighter bounds (5x to 0.2x of initial price to prevent extreme values)
+            new_price = np.clip(new_price, price * 0.2, price * 5)
+            prices.append(new_price)
 
         # Create OHLCV data
         df = pd.DataFrame(index=dates)
@@ -355,6 +444,13 @@ def load_market_data(symbol: str, timeframe: str, start: datetime, end: datetime
         # Filter by date range
         mask = (df.index >= start) & (df.index <= end)
         df = df[mask].copy()
+
+        # Fix: Validate all prices are finite before returning
+        for col in ['open', 'high', 'low', 'close']:
+            inf_mask = ~np.isfinite(df[col])
+            if inf_mask.any():
+                logger.warning(f"Found {inf_mask.sum()} non-finite values in {col}, replacing with previous value")
+                df[col] = df[col].replace([np.inf, -np.inf], np.nan).ffill().fillna(price)
 
         # Ensure we have enough data
         if len(df) < 50:

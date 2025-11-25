@@ -50,7 +50,7 @@ venv.bak/
 *.ipr
 
 # Data
-data/
+/data/
 *.sqlite
 *.db
 *.parquet

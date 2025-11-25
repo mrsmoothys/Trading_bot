@@ -14,7 +14,6 @@ from loguru import logger
 
 # Import DeepSeek client and system context
 import sys
-sys.path.insert(0, '/Users/mrsmoothy/Downloads/Trading_bot')
 
 from core.system_context import SystemContext
 from deepseek.client import DeepSeekBrain

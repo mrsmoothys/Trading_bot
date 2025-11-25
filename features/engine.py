@@ -29,12 +29,29 @@ def calculate_liquidity_zones(
     volume: pd.Series,
     lookback_periods: int = 100,
     price_bins: int = 50,
+    min_zone_spacing_pct: float = 0.5,
+    percentile_threshold: float = 95.0,
+    recent_weight_multiplier: float = 1.5,
 ) -> Dict[str, Any]:
     """
     IDENTIFY PRICE LEVELS WHERE LARGE ORDERS RESIDE.
 
-    This function identifies institutional accumulation and distribution zones
-    by analyzing volume distribution across price levels.
+    Enhanced version with improved volume distribution:
+    - Better volume distribution across price bins using close position weighting
+    - Recent activity gets extra weight (last 50 periods × multiplier)
+    - Zone clustering prevention (minimum spacing)
+    - Configurable threshold for liquidity detection
+
+    Args:
+        high: High prices
+        low: Low prices
+        close: Close prices
+        volume: Volume data
+        lookback_periods: Periods to analyze (default: 100)
+        price_bins: Number of price bins (default: 50)
+        min_zone_spacing_pct: Minimum spacing between zones in % (default: 0.5)
+        percentile_threshold: Percentile for significant volume (default: 95.0)
+        recent_weight_multiplier: Recent periods weight multiplier (default: 1.5)
 
     Returns:
         Dict containing liquidity zone information including support/resistance levels
@@ -47,46 +64,159 @@ def calculate_liquidity_zones(
     close_slice = close.iloc[-data_slice:]
     volume_slice = volume.iloc[-data_slice:]
 
-    # Calculate volume-weighted price levels
-    typical_price = (high_slice + low_slice + close_slice) / 3
-    volume_weighted_price = (typical_price * volume_slice).cumsum() / volume_slice.cumsum()
-
-    # Create price bins
+    # Create price bins with padding
     price_range = (low_slice.min(), high_slice.max())
-    price_bins_array = np.linspace(price_range[0], price_range[1], price_bins)
+    padding = (price_range[1] - price_range[0]) * 0.05  # 5% padding
+    price_bins_array = np.linspace(
+        price_range[0] - padding,
+        price_range[1] + padding,
+        price_bins
+    )
 
-    # Distribute volume across price bins
+    # Initialize volume distribution
     volume_at_price = np.zeros(len(price_bins_array) - 1)
+    bin_centers = (price_bins_array[:-1] + price_bins_array[1:]) / 2
 
+    # DISTRIBUTE VOLUME - Enhanced method with close position weighting
     for i in range(len(high_slice)):
         low_price = low_slice.iloc[i]
         high_price = high_slice.iloc[i]
+        close_price = close_slice.iloc[i]
         vol = volume_slice.iloc[i]
 
-        # Distribute volume across price bins this candle touched
-        for j in range(len(price_bins_array) - 1):
+        candle_range = high_price - low_price
+        if candle_range == 0:
+            # Single price point - put in closest bin
+            bin_idx = np.digitize(close_price, price_bins_array) - 1
+            bin_idx = max(0, min(bin_idx, len(volume_at_price) - 1))
+            volume_at_price[bin_idx] += vol
+            continue
+
+        # Close position within the candle (0 to 1)
+        close_position = (close_price - low_price) / candle_range
+
+        # Find bins this candle touches
+        start_bin = np.digitize(low_price, price_bins_array) - 1
+        end_bin = np.digitize(high_price, price_bins_array) - 1
+        start_bin = max(0, start_bin)
+        end_bin = min(len(volume_at_price) - 1, end_bin)
+
+        # Distribute volume across bins
+        for j in range(start_bin, end_bin + 1):
             bin_low = price_bins_array[j]
             bin_high = price_bins_array[j + 1]
+            bin_center = bin_centers[j]
 
-            # Check if there's an overlap
-            if high_price < bin_low or low_price > bin_high:
+            # Calculate overlap
+            overlap = min(high_price, bin_high) - max(low_price, bin_low)
+            overlap_ratio = overlap / candle_range
+
+            # Weight by close position - bullish closes add weight to upper bins
+            if overlap_ratio > 0:
+                bin_position = (bin_center - low_price) / candle_range
+
+                # Base weight from overlap
+                weight = overlap_ratio
+
+                # Close position bonus
+                if close_position > 0.6:  # Bullish close
+                    if bin_position >= close_position:
+                        weight *= 1.3  # 30% bonus for upper portion
+                elif close_position < 0.4:  # Bearish close
+                    if bin_position <= close_position:
+                        weight *= 1.3  # 30% bonus for lower portion
+
+                volume_at_price[j] += vol * weight
+
+    # RECENT ACTIVITY WEIGHTING (last 50 periods get extra weight)
+    recent_periods = min(50, data_slice // 2)
+    if recent_periods > 10:
+        recent_volume = np.zeros(len(volume_at_price))
+
+        for i in range(recent_periods):
+            idx = len(high_slice) - 1 - i
+            if idx < 0:
                 continue
 
-            # Calculate overlap ratio
-            overlap = min(high_price, bin_high) - max(low_price, bin_low)
-            overlap_ratio = overlap / (high_price - low_price) if (high_price - low_price) > 0 else 0
-            volume_at_price[j] += vol * overlap_ratio
+            low_price = high_slice.iloc[idx] if idx >= len(high_slice) else high_slice.iloc[-1]
+            high_price = high_slice.iloc[idx]
+            low_price = low_slice.iloc[idx]
+            close_price = close_slice.iloc[idx]
+            vol = volume_slice.iloc[idx] * recent_weight_multiplier
 
-    # Identify significant liquidity levels (top 5%)
-    volume_threshold = np.percentile(volume_at_price, 95)
-    significant_bins = price_bins_array[:-1][volume_at_price > volume_threshold]
+            candle_range = high_price - low_price
+            if candle_range == 0:
+                continue
 
-    # Calculate current price relation to liquidity zones
-    current_price = close_slice.iloc[-1]
+            start_bin = max(0, np.digitize(low_price, price_bins_array) - 1)
+            end_bin = min(len(recent_volume) - 1, np.digitize(high_price, price_bins_array) - 1)
+
+            for j in range(start_bin, end_bin + 1):
+                bin_low = price_bins_array[j]
+                bin_high = price_bins_array[j + 1]
+
+                overlap = min(high_price, bin_high) - max(low_price, bin_low)
+                overlap_ratio = overlap / candle_range
+
+                if overlap_ratio > 0:
+                    recent_volume[j] += vol * overlap_ratio
+
+        # Combine recent with overall (30% weight to recent)
+        volume_at_price = volume_at_price * 0.7 + recent_volume * 0.3
+
+    # SMOOTH THE DISTRIBUTION
+    if len(volume_at_price) > 5:
+        kernel = np.array([0.1, 0.2, 0.4, 0.2, 0.1])
+        padded = np.pad(volume_at_price, 2, mode='edge')
+        volume_at_price_smooth = np.convolve(padded, kernel, mode='valid')
+    else:
+        volume_at_price_smooth = volume_at_price.copy()
+
+    # IDENTIFY LIQUIDITY ZONES
+    volume_threshold = np.percentile(volume_at_price_smooth, percentile_threshold)
+    significant_indices = np.where(volume_at_price_smooth > volume_threshold)[0]
+
+    if len(significant_indices) > 0:
+        raw_zones = bin_centers[significant_indices]
+        raw_strengths = volume_at_price_smooth[significant_indices]
+
+        # FILTER: Remove too-close zones
+        filtered_zones = []
+        filtered_strengths = []
+        min_spacing = close_slice.iloc[-1] * min_zone_spacing_pct / 100
+
+        # Sort by strength (highest first)
+        sorted_pairs = sorted(zip(raw_zones, raw_strengths), key=lambda x: x[1], reverse=True)
+
+        for zone, strength in sorted_pairs:
+            # Check minimum spacing
+            too_close = False
+            for existing_zone in filtered_zones:
+                if abs(zone - existing_zone) < min_spacing:
+                    too_close = True
+                    break
+
+            if not too_close:
+                filtered_zones.append(zone)
+                filtered_strengths.append(strength)
+
+        # Sort by distance from current price
+        current_price = close_slice.iloc[-1]
+        filtered_pairs = sorted(zip(filtered_zones, filtered_strengths),
+                                key=lambda x: abs(x[0] - current_price))
+        significant_bins = np.array([p[0] for p in filtered_pairs])
+        zone_strengths = np.array([p[1] for p in filtered_pairs])
+    else:
+        significant_bins = np.array([])
+        zone_strengths = np.array([])
+        current_price = close_slice.iloc[-1]
+
+    # Calculate zone metrics
     if len(significant_bins) > 0:
-        nearest_zone = significant_bins[np.argmin(np.abs(significant_bins - current_price))]
-        distance_to_zone = (current_price - nearest_zone) / current_price
-        zone_strength = volume_at_price.max() / volume_at_price.mean() if volume_at_price.mean() > 0 else 0
+        nearest_zone_idx = np.argmin(np.abs(significant_bins - current_price))
+        nearest_zone = significant_bins[nearest_zone_idx]
+        distance_to_zone = abs(current_price - nearest_zone) / current_price
+        zone_strength = zone_strengths[nearest_zone_idx] / volume_at_price_smooth.mean()
         above_below = "above" if current_price > nearest_zone else "below"
     else:
         nearest_zone = current_price
@@ -94,9 +224,11 @@ def calculate_liquidity_zones(
         zone_strength = 0
         above_below = "at"
 
-    # Separate into support and resistance levels for convergence strategy
+    # Separate into support and resistance
     resistance_levels = [float(z) for z in significant_bins if z > current_price]
     support_levels = [float(z) for z in significant_bins if z < current_price]
+    resistance_levels.sort()
+    support_levels.sort(reverse=True)
 
     # Find nearest support and resistance
     def find_nearest_level(price, levels, below=True):
@@ -114,6 +246,7 @@ def calculate_liquidity_zones(
 
     return {
         "liquidity_zones": significant_bins.tolist(),
+        "zone_strengths": zone_strengths.tolist() if len(zone_strengths) > 0 else [],
         "nearest_zone": float(nearest_zone),
         "distance_to_zone_pct": float(distance_to_zone),
         "zone_strength": float(zone_strength),
@@ -124,6 +257,12 @@ def calculate_liquidity_zones(
         "support_levels": support_levels,
         "current_nearest_support": nearest_support,
         "current_nearest_resistance": nearest_resistance,
+        # Volume stats
+        "volume_stats": {
+            "mean": float(volume_at_price_smooth.mean()),
+            "max": float(volume_at_price_smooth.max()),
+            "concentration": float(volume_at_price_smooth.max() / volume_at_price_smooth.mean() if volume_at_price_smooth.mean() > 0 else 0),
+        }
     }
 
 

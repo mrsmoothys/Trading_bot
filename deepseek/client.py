@@ -463,6 +463,7 @@ Return optimal size as a decimal (e.g., 0.05 for 5%). Respond in JSON."""
 CURRENT MARKET DATA:
 - Price: ${market_data.get('price', 'N/A')}
 - 24h Change: {market_data.get('change_24h', 'N/A')}%
+- Sentiment: {system_state.get('sentiment', {}).get('value', 'N/A')} ({system_state.get('sentiment', {}).get('classification', 'N/A')})
 
 TECHNICAL FEATURES:
 - Market Regime: {features.get('market_regime', 'UNKNOWN')}
@@ -559,6 +560,8 @@ Respond helpfully as DeepSeek AI, taking the conversation into account."""
         return f"""Assess risk for this trade:
 
 {risk_context}
+
+SENTIMENT: {self.system_context.sentiment.get('value', 'N/A')} ({self.system_context.sentiment.get('classification', 'N/A')})
 
 Respond in JSON:
 {{

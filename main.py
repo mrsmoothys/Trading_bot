@@ -19,6 +19,7 @@ import sys
 from datetime import datetime
 from loguru import logger
 import yaml
+import threading
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -73,14 +74,14 @@ class DeepSeekTradingSystem:
 
         self.signal_generator = SignalGenerator(
             self.system_context,
-            self.deepseek, # Changed from deepseek_brain
+            self.deepseek_brain,
             self.feature_engine
         )
         
         # Initialize Autonomous Optimizer
         self.optimizer = AutonomousOptimizer(
             self.system_context,
-            self.deepseek
+            self.deepseek_brain
         )
 
         # Trading symbols
@@ -260,18 +261,20 @@ class DeepSeekTradingSystem:
             port: Dashboard port
             debug: Enable debug mode
         """
-        logger.info(f"Starting dashboard on port {port}...")
+        try:
+            logger.info(f"Starting dashboard on port {port}...")
 
-        # Create Dash app with multiple pages
-        app = create_dashboard_app()
+            # Inject SystemContext
+            from ui.dashboard import set_system_context
+            set_system_context(self.system_context)
 
-        # Note: In a full implementation, you would:
-        # 1. Register all pages
-        # 2. Connect callbacks to real data
-        # 3. Start the server
+            # Create Dash app with multiple pages
+            app = create_dashboard_app()
 
-        logger.info(f"Dashboard ready at http://localhost:{port}")
-        # app.run_server(host='0.0.0.0', port=port, debug=debug)
+            logger.info(f"Dashboard ready at http://localhost:{port}")
+            app.run_server(host='0.0.0.0', port=port, debug=debug, use_reloader=False)
+        except Exception as e:
+            logger.error(f"Failed to start dashboard: {e}")
 
     def start_chat(self, port: int = 8051, debug: bool = False):
         """
@@ -330,6 +333,14 @@ async def main():
     """Main entry point."""
     # Initialize system
     system = DeepSeekTradingSystem()
+
+    # Start dashboard in a separate thread
+    dashboard_thread = threading.Thread(
+        target=system.start_dashboard,
+        kwargs={'port': 8050, 'debug': False},
+        daemon=True
+    )
+    dashboard_thread.start()
 
     # Start the system
     system.running = True

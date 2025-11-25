@@ -4,12 +4,14 @@ Manages trading positions, order execution, and tracking.
 """
 
 import asyncio
+import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from loguru import logger
 
 from core.system_context import SystemContext
 from deepseek.client import DeepSeekBrain
+from ops.db import get_database
 
 
 class PositionManager:
@@ -42,6 +44,8 @@ class PositionManager:
         # Configuration
         self.max_positions = 10
         self.default_leverage = 1
+        self.db_enabled = os.getenv("ACTIVE_POSITION_DB_ENABLED", "false").lower() == "true"
+        self.db = get_database() if self.db_enabled else None
 
         # Convergence Strategy Integration
         self.enable_multi_layer_tp = True  # Enable multi-layer take profits
@@ -56,6 +60,47 @@ class PositionManager:
             logger.warning("PositionManager initialized - LIVE MODE (Real money!)")
 
         logger.info(f"PositionManager initialized - Multi-layer TP: {self.enable_multi_layer_tp}")
+
+        # Reconcile positions on init
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(self._reconcile_positions_on_init())
+        else:
+            loop.run_until_complete(self._reconcile_positions_on_init())
+
+    async def _reconcile_positions_on_init(self):
+        """Reconcile positions from DB and disk on initialization."""
+        logger.info("[PERSISTENCE] Starting position reconciliation on init")
+
+        # Load active positions from DB if enabled
+        if self.db_enabled:
+            try:
+                positions = await self.db.get_active_positions()
+                logger.info(f"[PERSISTENCE] DB reconciliation: Found {len(positions)} positions in database")
+
+                # Reconcile with SystemContext state
+                loaded_count = 0
+                for pos in positions:
+                    symbol = pos.get("symbol")
+                    if symbol:
+                        self.system_context.active_positions[symbol] = pos
+                        loaded_count += 1
+
+                logger.info(f"[PERSISTENCE] Successfully loaded {loaded_count} active positions from DB into SystemContext")
+
+                # If DB has positions but SystemContext is empty, this is a recovery scenario
+                if loaded_count > 0:
+                    logger.info(f"[PERSISTENCE] Position recovery completed - {loaded_count} positions restored from database")
+            except Exception as e:
+                logger.error(f"[PERSISTENCE] Failed to load active positions from DB: {e}")
+                logger.warning(f"[PERSISTENCE] Continuing without DB positions - using only SystemContext state")
+
+        # Ensure initial state is persisted
+        try:
+            self.system_context.save_to_disk()
+            logger.info(f"[PERSISTENCE] Initial state saved to disk on PositionManager init")
+        except Exception as e:
+            logger.error(f"[PERSISTENCE] Failed to save initial state to disk: {e}")
 
     async def evaluate_signal(
         self,
@@ -196,9 +241,28 @@ class PositionManager:
 
             # If successful, update system context
             if order_result['success']:
-                self._update_position(
-                    symbol, order_result['order'], signal, position_size
-                )
+                self._update_position(symbol, order_result['order'], signal, position_size)
+
+                # Persist to disk with error handling
+                try:
+                    self.system_context.save_to_disk()
+                    logger.info(f"[PERSISTENCE] Position state saved to disk for {symbol}")
+                except Exception as disk_err:
+                    logger.error(f"[PERSISTENCE] Failed to save position to disk for {symbol}: {disk_err}")
+                    # Continue anyway - the position is in memory
+
+                # Persist to DB if enabled with enhanced error handling
+                if self.db_enabled and self.db:
+                    try:
+                        position_data = self.system_context.active_positions.get(symbol, {})
+                        if position_data:
+                            await self.db.save_active_position(position_data)
+                            logger.info(f"[PERSISTENCE] Position {symbol} saved to database")
+                        else:
+                            logger.warning(f"[PERSISTENCE] No position data found for {symbol} before DB save")
+                    except Exception as db_err:
+                        logger.error(f"[PERSISTENCE] DB save failed for {symbol}: {db_err}")
+                        logger.warning(f"[PERSISTENCE] Position {symbol} is in memory and will persist on next save")
 
                 # Track live order ID if this was a real order
                 if 'orderId' in order_result['order']:
@@ -321,6 +385,23 @@ class PositionManager:
                 f"Position closed: {symbol} P&L: ${pnl:.2f} ({pnl_percent:.2f}%)"
             )
 
+            # Persist to disk with error handling
+            try:
+                self.system_context.save_to_disk()
+                logger.info(f"[PERSISTENCE] Position {symbol} closure state saved to disk")
+            except Exception as disk_err:
+                logger.error(f"[PERSISTENCE] Failed to save position closure to disk for {symbol}: {disk_err}")
+                # Continue anyway - the closure is in memory
+
+            # Persist to DB if enabled with enhanced error handling
+            if self.db_enabled and self.db:
+                try:
+                    await self.db.close_position(symbol, close_result)
+                    logger.info(f"[PERSISTENCE] Position {symbol} closed in database")
+                except Exception as db_err:
+                    logger.error(f"[PERSISTENCE] DB close failed for {symbol}: {db_err}")
+                    logger.warning(f"[PERSISTENCE] Position {symbol} closure recorded in memory only")
+
             return close_result
 
         except Exception as e:
@@ -361,6 +442,17 @@ class PositionManager:
 
             # Update system risk metrics
             self.system_context._update_risk_metrics()
+
+            # Persist state to disk for split-brain protection
+            self.system_context.save_to_disk()
+
+            # Persist active positions to DB if enabled
+            if self.db_enabled and self.db:
+                for pos in self.system_context.active_positions.values():
+                    try:
+                        await self.db.save_active_position(pos)
+                    except Exception as db_err:
+                        logger.error(f"DB save failed for {pos.get('symbol')}: {db_err}")
 
         except Exception as e:
             logger.error(f"Error updating positions: {e}")

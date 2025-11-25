@@ -23,6 +23,14 @@ This is a **DeepSeek Trading Dashboard** - a professional-grade, AI-powered trad
 - LONG/SHORT signal annotations
 - Convergence Strategy panel with real-time updates
 
+**✅ Backtest Lab & Strategy Testing**
+- Interactive Backtest Lab with symbol, timeframe, and strategy selectors
+- View Details dialog with equity curves, trade breakdowns, and performance heatmaps
+- Full backtest matrix: 4 strategies × 6 timeframes (24 combinations)
+- Data integrity validation with freshness badges (OK/Stale/Missing)
+- Loading states with spinners for all selectors
+- 4 Trading Strategies: Convergence, Scalp 15m/4h, MA Crossover, RSI Divergence
+
 **✅ DeepSeek AI Integration**
 - Chat-to-chart synchronization
 - Quick action buttons (9 predefined actions including Convergence Strategy)
@@ -58,6 +66,15 @@ Trading Bot System
 
 ### Key Features Implemented
 
+**Backtest Lab (ui/dashboard.py - Backtest Lab section)**
+- Interactive backtesting interface with real-time data validation
+- View Details modal: equity curve visualization, trade-by-trade breakdown, monthly/weekly heatmaps
+- Data source badges showing "Data OK" (<5min), "Data Stale" (5-30min), "Data Missing" (>30min)
+- Loading spinners for all selectors (symbol, timeframe, strategy) to prevent re-entrancy
+- BACKTEST_MODE flag enforces live data only (no sample data fallback)
+- Multi-timeframe support: 1m, 5m, 15m, 1h, 4h, 1d
+- Results stored in backtest-result-store with full metrics and trade details
+
 **Chart System (ui/dashboard.py - 3016 lines)**
 - Multi-panel Plotly charts: Price (70%) + Volume (15%) + Order Flow (15%)
 - 6 overlay types: Liquidity Zones, Supertrend, Chandelier Exit, Order Flow, Market Regime, Timeframe Alignment
@@ -73,6 +90,7 @@ Trading Bot System
 - Chat-to-chart synchronization (keywords trigger overlay highlights)
 - Quick action buttons (8 predefined actions)
 - Audit logging enabled
+- Timeout increased to 60s for improved reliability
 
 **System Context (core/system_context.py)**
 - Overlay state tracking (overlay_state dictionary)
@@ -87,7 +105,9 @@ Trading Bot System
 - **NEW**: generate_convergence_signal() async method (lines 104-219)
 - **NEW**: _format_convergence_reasoning() helper (lines 221-250)
 
-**Multi-Timeframe Convergence Strategy (core/strategies/convergence_system.py - 558 lines)**
+**Trading Strategies (core/strategies/)**
+
+**1. Convergence Strategy (convergence_system.py - 558 lines)**
 - **MarketRegime enum** (4 types): LOW_VOL_COMPRESSION, NORMAL_REGIME, TREND_HIGH_VOL, RANGING_HIGH_VOL
 - **AlignmentState enum** (3 states): STRONG_BULLISH_ALIGNMENT, STRONG_BEARISH_ALIGNMENT, MIXED_SIGNALS
 - **ConvergenceSignal dataclass** with full trading signal structure
@@ -104,6 +124,23 @@ Trading Bot System
   10. `generate_signal()` - Main signal generation entry point
   11. `_get_timeframe_weight()` - Timeframe weighting system (1m=0.5, 5m=0.7, 15m=1.0, 1h=1.5, 4h=2.0, 1d=3.0)
   12. `_find_nearest_level()` - Liquidity level identification
+
+**2. MA Crossover (ma_crossover.py)**
+- Simple moving average crossover strategy
+- Default parameters: fast=10, slow=30 periods
+- Generates trades on MA cross signals
+- Optimized for multiple timeframes
+
+**3. RSI Divergence (rsi_divergence.py)**
+- RSI-based divergence detection strategy
+- Signal throttling via rolling window (prevents overtrading)
+- Position sizing controls to limit risk
+- Divergence-based entry/exit signals
+
+**4. Scalp 15m/4h (scalp_15m_4h.py)**
+- Short-term scalping strategy
+- Multi-timeframe analysis (15m entries, 4h trend)
+- Quick in/out trades with tight stop losses
 
 **Feature Engine (features/engine.py - 744 lines)**
 - `calculate_liquidity_zones()` - Returns support/resistance levels and nearest levels
@@ -223,6 +260,19 @@ app.run(host='0.0.0.0', port=8050, debug=False)
 
 ### Backtesting Results
 
+**Full Backtest Matrix (Nov 2025)**
+- **Period**: 2024-01-01 to 2025-11-24
+- **Symbol**: BTCUSDT
+- **Initial Capital**: $10,000
+- **Total Combinations**: 24 (4 strategies × 6 timeframes)
+- **Success Rate**: 24/24 (100%)
+
+**Strategy Performance Highlights**:
+- **Convergence Strategy**: Best performance on longer timeframes (-3.79% on 1D, 288 trades, 44.1% win rate)
+- **Scalp 15m/4h**: Variable performance across timeframes
+- **MA Crossover**: Consistent trade generation with default params (fast=10, slow=30)
+- **RSI Divergence**: Throttled signals to prevent overtrading
+
 **convergence_backtest.py** (340 lines - demonstrating strategy on BTCUSDT sample data)
 - Total Trades: 44
 - Winning Trades: 15
@@ -246,6 +296,16 @@ pytest tests/test_plotly_overlays.py::TestPlotlyOverlaySnapshots::test_liquidity
 
 # Test with output
 pytest tests/test_plotly_overlays.py -v -s
+
+# Test Backtest Lab functionality
+pytest tests/test_dashboard_smoke.py -v
+pytest tests/test_dashboard_chart_verification.py -v
+
+# Test Convergence Strategy
+pytest tests/test_convergence_strategy.py -v
+
+# Test backtesting components
+pytest tests/ -k backtest -v
 ```
 
 ## Implementation Plan
@@ -267,7 +327,16 @@ pytest tests/test_plotly_overlays.py -v -s
 - Feature toggle system
 - Range selector/slider
 - Signal annotations
+- Backtest Lab with View Details modal
 - Dash callbacks for interactivity
+- Data integrity validation and freshness badges
+
+**backtesting/service.py**
+- Backtest execution engine
+- Equity curve calculation and storage
+- Trade-by-trade breakdown with P&L
+- Results storage in backtest-result-store
+- BACKTEST_MODE enforcement for data integrity
 
 **core/system_context.py**
 - Global state management
@@ -295,6 +364,19 @@ pytest tests/test_plotly_overlays.py -v -s
 - Manual testing checklist
 - Automated test execution guide
 - Sign-off procedures
+
+**BACKTEST_AND_CHAT_REPORT.md**
+- Complete backtest matrix results (24 combinations)
+- Backtest Lab UX fixes documentation
+- Data integrity improvements
+- Strategy performance analysis
+- Chat reliability enhancements
+
+**vibecoder_plan.md**
+- Recent implementation plan for Backtest Lab
+- Step-by-step guide for data integrity fixes
+- Strategy normalization details
+- UI/UX improvement roadmap
 
 **CODEBASE_CLEANUP_SUMMARY.md**
 - Documents codebase cleanup
@@ -389,7 +471,10 @@ make format
 ### 3. Testing Dashboard Changes
 
 ```bash
-# Start dashboard
+# Start dashboard with auth disabled and increased timeout
+DASH_AUTH_DISABLED=true CHAT_RESPONSE_TIMEOUT=60 python -m ui.dashboard
+
+# Or using Makefile
 make run-dashboard
 
 # In Chrome: Navigate to http://127.0.0.1:8050
@@ -400,6 +485,9 @@ make run-dashboard
 # - Use range selector buttons
 # - Check for LONG/SHORT signals on chart
 # - Test chat interface (bottom right)
+# - Open Backtest Lab and verify data freshness badges
+# - Run backtests and inspect View Details modal
+# - Verify equity curves and trade breakdowns
 ```
 
 ### 4. Common Issues & Solutions
@@ -443,6 +531,11 @@ pytest tests/test_plotly_overlays.py -v --tb=short
 - `BINANCE_API_KEY` - For live data (testnet available)
 - Chat interface works in demo mode without API key
 
+### Configuration Variables
+- `DASH_AUTH_DISABLED=true` - Disable authentication for development
+- `CHAT_RESPONSE_TIMEOUT=60` - Increase chat timeout to 60s for reliability
+- `BACKTEST_MODE=true` - Enforce live data only in backtests (no sample data fallback)
+
 ### Database
 - SQLite by default (DATABASE_URL in config)
 - Signal logging with overlay metadata
@@ -466,42 +559,59 @@ Dashboard tested on:
 - Ctrl+1-6: Switch timeframes (1m, 5m, 15m, 1h, 4h, 1d)
 - ESC: Clear selection
 
-## Current Status (as of 2025-11-16)
+## Current Status (as of 2025-11-24)
 
 ✅ **All 27 tasks from vibecoder_implementation.json complete**
 ✅ **All 7 phases implemented + Convergence Strategy (Phase 8)**
+✅ **W2.4 UX Polish Implementation complete**
 ✅ **24/24 Plotly overlay tests passing**
 ✅ **30/30 Convergence strategy tests passing**
+✅ **Backtest Lab fully functional with View Details modal**
+✅ **Full backtest matrix executed: 24/24 combinations successful**
+✅ **Data integrity validation implemented (freshness badges)**
+✅ **4 Trading Strategies implemented and tested**
 ✅ **QA checklist created (150+ points)**
 ✅ **Codebase cleaned (removed obsolete files, cache)**
 ✅ **Dashboard functional with all features**
-✅ **Multi-Timeframe Convergence Strategy fully implemented and tested**
+✅ **Chat timeout increased to 60s for reliability**
 
 ### Key Metrics
 - Test Coverage: Comprehensive (tests/test_plotly_overlays.py, tests/test_convergence_strategy.py)
 - QA Checklist: 150+ points (docs/QA_CHECKLIST.md)
 - Overlays: 6 types fully implemented
-- Chat Integration: Fully functional with DeepSeek AI
-- Documentation: Complete (QUICKSTART.md, RUNBOOK.md, CONVERGENCE_STRATEGY_COMPLETION_REPORT.md)
+- Chat Integration: Fully functional with DeepSeek AI (60s timeout)
+- Trading Strategies: 4 implemented (Convergence, Scalp 15m/4h, MA Crossover, RSI Divergence)
+- Backtest Lab: Full UI with equity curves, trade breakdowns, performance heatmaps
+- Documentation: Complete (QUICKSTART.md, RUNBOOK.md, CONVERGENCE_STRATEGY_COMPLETION_REPORT.md, BACKTEST_AND_CHAT_REPORT.md)
 - Convergence Strategy: Production-ready with dashboard panel and chat integration
+- Backtest Matrix: 24/24 strategy/timeframe combinations tested successfully
 - Lines of Code: ~1,950+ (Convergence Strategy implementation)
-- Test Files Created: 2 (test_convergence_strategy.py, convergence_backtest.py)
+- Test Files Created: 2 (test_convergence_strategy.py, convergence_backtest.py) + backtest validation tests
 
 ## Getting Started for New Developers
 
 1. **Read QUICKSTART.md** for installation and basic usage
 2. **Review the implementation plan** in vibecoder_implementation.json
 3. **Run the test suite**: `make test-fast`
-4. **Start the dashboard**: `make run-dashboard`
+4. **Start the dashboard**: `DASH_AUTH_DISABLED=true CHAT_RESPONSE_TIMEOUT=60 python -m ui.dashboard`
 5. **Open in browser**: http://127.0.0.1:8050
 6. **Explore the code**: Start with ui/dashboard.py and core/system_context.py
 7. **Review test suite**:
    - tests/test_plotly_overlays.py (24 passing tests)
    - tests/test_convergence_strategy.py (30 passing tests)
-8. **Test Convergence Strategy**:
+   - tests/test_dashboard_smoke.py (dashboard functionality tests)
+8. **Test Backtest Lab**:
+   - Navigate to Backtest Lab tab
+   - Verify data freshness badges are green
+   - Run backtests with different strategies/timeframes
+   - Click "View Details" to inspect equity curves and trade breakdowns
+9. **Test Convergence Strategy**:
    - Run: `python convergence_backtest.py`
    - Dashboard: Click "🎯 Run Convergence Strategy" button in the panel
    - Chat: Click "🎯 Convergence Strategy" quick action button
+10. **Review recent changes**:
+    - BACKTEST_AND_CHAT_REPORT.md for backtest matrix results
+    - vibecoder_plan.md for recent implementation details
 
 ## Key Documentation Files
 
@@ -509,6 +619,8 @@ Dashboard tested on:
 - `docs/QA_CHECKLIST.md` - 150+ point QA testing checklist
 - `CODEBASE_CLEANUP_SUMMARY.md` - Recent cleanup actions
 - `vibecoder_implementation.json` - Complete implementation plan
+- `vibecoder_plan.md` - Recent Backtest Lab implementation plan
+- `BACKTEST_AND_CHAT_REPORT.md` - Full backtest matrix results and UX fixes
 - `RUNBOOK.md` - Operations and maintenance guide
 
 ## Convergence Strategy Documentation
@@ -531,10 +643,12 @@ Dashboard tested on:
 
 **Testing & Validation:**
 - `tests/test_convergence_strategy.py` - 530 lines, 30 unit tests (all passing)
+- `tests/test_dashboard_smoke.py` - Dashboard functionality tests
+- `tests/test_dashboard_chart_verification.py` - Chart rendering tests
 - `convergence_backtest.py` - 340 lines, backtest demonstration
 
 **Dashboard Integration:**
-- `ui/dashboard.py` - Convergence Strategy panel (lines 1481-1647)
+- `ui/dashboard.py` - Convergence Strategy panel (lines 1481-1647), Backtest Lab section
 - `ui/chat_interface.py` - Quick-action buttons
 
 **Usage:**
@@ -545,7 +659,13 @@ pytest tests/test_convergence_strategy.py -v
 # Run backtest
 python convergence_backtest.py
 
-# Start dashboard
+# Start dashboard with recommended settings
+DASH_AUTH_DISABLED=true CHAT_RESPONSE_TIMEOUT=60 python -m ui.dashboard
+
+# Or use Makefile
 make run-dashboard
-# Then click "🎯 Run Convergence Strategy" in the dashboard panel
+
+# Test Backtest Lab
+# Navigate to http://127.0.0.1:8050 → Backtest Lab tab
+# Run strategy backtests and click "View Details"
 ```

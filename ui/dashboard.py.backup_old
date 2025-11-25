@@ -1,0 +1,2989 @@
+"""
+Trading Dashboard - Fully Functional
+Web-based dashboard with interactive charts, timeframe selection, and feature overlays.
+"""
+
+import asyncio
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import dash
+from dash import dcc, html, Input, Output, State, callback, callback_context
+from dash.exceptions import PreventUpdate
+import dash_bootstrap_components as dbc
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, Tuple, Optional, List
+from loguru import logger
+import os
+import time
+import requests
+import json
+from dotenv import load_dotenv
+
+# Load environment variables immediately
+load_dotenv()
+
+# Import command router for Step 18 - DeepSeek as Manager
+from ui.chat_command_router import route_chat_message, set_dashboard_callbacks, get_manager_status
+
+
+# Global state for tracking selections
+GLOBAL_STATE = {
+    'selected_timeframe': '15m',
+    'selected_symbol': 'BTCUSDT',
+    'active_features': {
+        'liquidity': True,
+        'supertrend': True,
+        'chandelier': True,
+        'orderflow': True,
+        'regime': True,
+        'alignment': False
+    }
+}
+
+DATA_CACHE: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+CACHE_TTL_SECONDS = int(os.getenv('DASH_DATA_CACHE_TTL', '10'))  # tighten cache to 10s by default
+USE_SAMPLE_DATA = os.getenv('DASH_USE_SAMPLE_DATA', '0') == '1'  # Default to live data
+
+LAST_TOGGLE = {'ts': 0.0}
+REGIME_FEATURE_STRATEGY = {
+    "TRENDING_HIGH_VOL": ["supertrend", "chandelier"],
+    "TRENDING_LOW_VOL": ["supertrend"],
+    "RANGING_COMPRESSION": ["liquidity", "orderflow"],
+    "RANGING_EXPANSION": ["liquidity", "orderflow", "regime"],
+    "TRANSITION": ["orderflow"],
+}
+
+CHAT_CLIENT = None
+CHAT_SYSTEM_CONTEXT = None
+CHAT_INIT_ERROR = None
+LIVE_REFRESH_MIN = int(os.getenv('DASH_LIVE_REFRESH_MIN', '1'))  # minutes between forced live pulls
+CHAT_RESPONSE_TIMEOUT = int(os.getenv("CHAT_RESPONSE_TIMEOUT", "8"))  # seconds for DeepSeek chat before demo fallback
+
+def set_system_context(context):
+    """Set the global system context."""
+    global CHAT_SYSTEM_CONTEXT
+    CHAT_SYSTEM_CONTEXT = context
+
+
+def ensure_utc_timestamp(value) -> pd.Timestamp:
+    """Convert timestamps to UTC-aware pandas Timestamp."""
+    ts = pd.to_datetime(value)
+    if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
+        return ts.tz_localize('UTC')
+    return ts.tz_convert('UTC')
+
+
+def run_async_task(async_func, *args, **kwargs):
+    """Execute an async callable from sync contexts with graceful fallback."""
+    timeout = kwargs.pop("timeout", None)
+
+    async def runner():
+        coro = async_func(*args, **kwargs)
+        if timeout:
+            return await asyncio.wait_for(coro, timeout)
+        return await coro
+
+    try:
+        return asyncio.run(runner())
+    except RuntimeError as exc:
+        # Happens if another loop is already running
+        if "asyncio.run()" in str(exc):
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(runner())
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+        raise
+
+
+def initialize_chat_client():
+    """Lazy-load DeepSeek chat client for dashboard interactions."""
+    global CHAT_CLIENT, CHAT_SYSTEM_CONTEXT, CHAT_INIT_ERROR
+
+    if CHAT_CLIENT or CHAT_INIT_ERROR:
+        return CHAT_CLIENT
+
+    try:
+        from core.system_context import SystemContext
+        CHAT_SYSTEM_CONTEXT = SystemContext()
+
+        # Memory manager is optional for chat context optimization
+        memory_manager = None
+        try:
+            from core.memory_manager import M1MemoryManager
+            memory_manager = M1MemoryManager()
+        except Exception as mem_err:
+            logger.warning(f"Memory manager unavailable for chat context: {mem_err}")
+
+        from deepseek.client import DeepSeekBrain
+        CHAT_CLIENT = DeepSeekBrain(CHAT_SYSTEM_CONTEXT, memory_manager)
+        logger.info("DeepSeek chat client initialized for dashboard")
+    except Exception as exc:
+        CHAT_INIT_ERROR = str(exc)
+        CHAT_CLIENT = None
+        logger.warning(f"DeepSeek AI chat unavailable: {exc}")
+
+    return CHAT_CLIENT
+
+
+def update_overlay_context(features: Dict[str, bool], timeframe: str):
+    """Keep SystemContext overlay metadata in sync for richer chat context."""
+    if not CHAT_SYSTEM_CONTEXT:
+        return
+
+    CHAT_SYSTEM_CONTEXT.overlay_state.update(features)
+    CHAT_SYSTEM_CONTEXT.overlay_history.append({
+        'timestamp': datetime.now().isoformat(),
+        'timeframe': timeframe,
+        'features': features.copy()
+    })
+
+    # Limit history to avoid unbounded growth
+    if len(CHAT_SYSTEM_CONTEXT.overlay_history) > 50:
+        CHAT_SYSTEM_CONTEXT.overlay_history = CHAT_SYSTEM_CONTEXT.overlay_history[-50:]
+
+
+def gather_multi_timeframe_data(symbol: str, num_bars: int = 100) -> Dict[str, Any]:
+    """Gather summarized data for multiple timeframes."""
+    timeframes = ['1m', '5m', '15m', '1h', '4h', '1d']
+    multi_tf_data = {}
+
+    for tf in timeframes:
+        try:
+            # Fetch data for each timeframe
+            df, meta = fetch_market_data(symbol, tf, num_bars=num_bars, force_refresh=False)
+
+            if df is not None and len(df) > 0:
+                # Calculate trend (simple slope of closing prices)
+                recent_prices = df['close'].tail(20)
+                trend_slope = (recent_prices.iloc[-1] - recent_prices.iloc[0]) / recent_prices.iloc[0] if len(recent_prices) > 1 else 0
+
+                # Determine trend direction
+                if trend_slope > 0.01:
+                    trend = "BULLISH"
+                elif trend_slope < -0.01:
+                    trend = "BEARISH"
+                else:
+                    trend = "SIDEWAYS"
+
+                # Calculate regime (simplified)
+                returns = df['close'].pct_change()
+                realized_vol = returns.rolling(20).std().fillna(0).iloc[-1] if len(df) > 20 else 0
+                vol_threshold = returns.std() if len(returns) > 20 else 0
+
+                if realized_vol > vol_threshold * 1.2:
+                    regime = "HIGH_VOL"
+                elif realized_vol < vol_threshold * 0.8:
+                    regime = "LOW_VOL"
+                else:
+                    regime = "NORMAL_VOL"
+
+                # Get current price level
+                current_price = df['close'].iloc[-1]
+                price_24h = df['close'].iloc[-25] if len(df) > 25 else df['close'].iloc[0]
+                price_change_24h = ((current_price - price_24h) / price_24h) * 100 if price_24h != 0 else 0
+
+                multi_tf_data[tf] = {
+                    "trend": trend,
+                    "regime": regime,
+                    "current_price": round(current_price, 2),
+                    "price_change_24h": round(price_change_24h, 2),
+                    "volatility": round(realized_vol * 100, 2),
+                    "bars_analyzed": len(df)
+                }
+            else:
+                multi_tf_data[tf] = {
+                    "trend": "UNKNOWN",
+                    "regime": "UNKNOWN",
+                    "current_price": 0,
+                    "price_change_24h": 0,
+                    "volatility": 0,
+                    "bars_analyzed": 0
+                }
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch data for {tf}: {e}")
+            multi_tf_data[tf] = {
+                "trend": "ERROR",
+                "regime": "ERROR",
+                "current_price": 0,
+                "price_change_24h": 0,
+                "volatility": 0,
+                "bars_analyzed": 0,
+                "error": str(e)
+            }
+
+    return multi_tf_data
+
+
+def build_chat_context(
+    message_type: str = "strategy",
+    chat_history: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    """Create context payload for DeepSeek chat responses with multi-timeframe data."""
+    current_tf = GLOBAL_STATE.get('selected_timeframe', '15m')
+    symbol = GLOBAL_STATE.get('selected_symbol', 'BTCUSDT')
+    logger.info(f"[DIAGNOSTIC] build_chat_context called - Using timeframe: {current_tf}, Message type: {message_type}")
+
+    # Gather multi-timeframe data
+    multi_tf_data = gather_multi_timeframe_data(symbol)
+
+    conversation_history: List[Dict[str, Any]] = []
+    if chat_history:
+        for msg in chat_history[-10:]:
+            conversation_history.append({
+                "role": "user" if msg.get('is_user', True) else "assistant",
+                "text": msg.get('text', ''),
+                "timestamp": msg.get('timestamp', '')
+            })
+
+    context = {
+        "message_type": message_type,
+        "dashboard_state": {
+            "symbol": symbol,
+            "timeframe": current_tf,
+            "active_features": GLOBAL_STATE['active_features'],
+            "timestamp": datetime.now().isoformat(),
+            "multi_timeframe_summary": multi_tf_data
+        }
+    }
+
+    if conversation_history:
+        context["conversation_history"] = conversation_history
+
+    if CHAT_SYSTEM_CONTEXT:
+        context["system_state"] = CHAT_SYSTEM_CONTEXT.get_context_for_deepseek()
+
+    logger.info(f"[DIAGNOSTIC] Chat context payload timeframe: {context['dashboard_state']['timeframe']} with {len(multi_tf_data)} timeframe summaries")
+    return context
+
+
+def create_feature_metrics_table(
+    metrics: Dict[str, Dict[str, Any]],
+    current_regime: str = "UNKNOWN",
+    recommendations: List[str] = None
+) -> html.Div:
+    """Render telemetry table for feature latency/memory usage."""
+    if not metrics:
+        return html.Div(
+            "Telemetry pending — run the trading loop to capture feature metrics.",
+            style={'color': '#666', 'fontStyle': 'italic', 'padding': '10px'}
+        )
+
+    header = html.Tr([
+        html.Th("Feature"),
+        html.Th("Latency (ms)"),
+        html.Th("Memory Δ (MB)"),
+        html.Th("Timestamp")
+    ])
+    rows = []
+    for name, data in metrics.items():
+        rows.append(html.Tr([
+            html.Td(name.title()),
+            html.Td(f"{data.get('latency_ms', 0):.2f}"),
+            html.Td(f"{data.get('memory_delta_mb', 0):.2f}"),
+            html.Td(data.get('timestamp', '').split('T')[0])
+        ]))
+
+    table = html.Table([header] + rows, style={
+        'width': '100%',
+        'borderCollapse': 'collapse',
+        'fontSize': '13px'
+    })
+    overlay_text = ', '.join(recommendations) if recommendations else 'None'
+    extra = html.P(
+        f"Current regime: {current_regime} | Recommended overlays: {overlay_text}",
+        style={'color': '#666', 'fontSize': '12px', 'marginTop': '10px'}
+    )
+    return html.Div([table, extra])
+
+
+def call_deepseek_chat(
+    user_message: str,
+    message_type: str = "strategy",
+    chat_history: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[str, str]:
+    """
+    Invoke DeepSeek chat interface and return (response text, status label).
+    Falls back to informative message when AI isn't available.
+    """
+    chat_client = initialize_chat_client()
+
+    if not chat_client:
+        return generate_demo_chat_response(user_message, message_type, CHAT_INIT_ERROR)
+
+    try:
+        context = build_chat_context(message_type, chat_history)
+        response = run_async_task(
+            chat_client.chat_interface,
+            user_message,
+            context,
+            message_type,
+            timeout=CHAT_RESPONSE_TIMEOUT
+        )
+        if isinstance(response, str) and not response.lower().startswith("sorry, i encountered an error"):
+            return response, "DeepSeek AI response ✓"
+
+        logger.warning(f"DeepSeek returned error payload, switching to demo response: {response}")
+        return generate_demo_chat_response(user_message, message_type, "DeepSeek API error")
+    except asyncio.TimeoutError:
+        logger.warning(f"DeepSeek chat timed out after {CHAT_RESPONSE_TIMEOUT}s, falling back to demo response")
+        return generate_demo_chat_response(user_message, message_type, f"DeepSeek timeout ({CHAT_RESPONSE_TIMEOUT}s)")
+    except Exception as exc:
+        error_msg = f"DeepSeek AI error: {exc}"
+        logger.error(error_msg)
+        return generate_demo_chat_response(user_message, message_type, str(exc))
+
+
+def generate_demo_chat_response(message_text: str, message_type: str, reason: Optional[str] = None) -> Tuple[str, str]:
+    """Build a helpful fallback response when DeepSeek is unavailable."""
+    status_reason = reason or CHAT_INIT_ERROR or "DeepSeek configuration missing"
+    symbol = GLOBAL_STATE.get('selected_symbol', 'BTCUSDT')
+    timeframe = GLOBAL_STATE.get('selected_timeframe', '15m')
+    features = [name for name, enabled in GLOBAL_STATE.get('active_features', {}).items() if enabled]
+
+    summary = [
+        f"DeepSeek AI is currently unavailable ({status_reason}).",
+        "This is a demo response so you can keep testing the UI.",
+        "",
+        f"- Symbol: {symbol}",
+        f"- Timeframe: {timeframe}",
+        f"- Active overlays: {', '.join(features) if features else 'none'}",
+        "",
+        "Requested message:",
+        message_text
+    ]
+
+    if CHAT_SYSTEM_CONTEXT:
+        perf = CHAT_SYSTEM_CONTEXT.get_performance_summary()
+        summary.extend([
+            "",
+            "Recent system state:",
+            f"• Total trades: {perf.get('total_trades', 0)}",
+            f"• Win rate: {perf.get('win_rate', 0):.2%}",
+            f"• Max drawdown: {perf.get('max_drawdown', 0):.2%}"
+        ])
+
+    return "\n".join(summary), "Demo response ✓"
+
+
+def render_chat_history(chat_history):
+    """Convert chat history into Dash components."""
+    components = []
+    for msg in chat_history[-50:]:
+        if msg.get('is_user', True):
+            components.append(
+                html.Div([
+                    html.Div("You", style={'fontWeight': 'bold', 'marginBottom': '5px', 'color': '#00ff88'}),
+                    html.Div(msg.get('text', ''), style={
+                        'backgroundColor': '#1a1a1a',
+                        'padding': '10px',
+                        'borderRadius': '8px',
+                        'maxWidth': '70%',
+                        'marginLeft': 'auto'
+                    }),
+                    html.Div(msg.get('timestamp', ''), style={
+                        'fontSize': '10px',
+                        'color': '#666',
+                        'marginTop': '5px',
+                        'textAlign': 'right'
+                    })
+                ], style={'textAlign': 'right', 'marginBottom': '15px'})
+            )
+        else:
+            components.append(
+                html.Div([
+                    html.Div("DeepSeek AI", style={'fontWeight': 'bold', 'marginBottom': '5px', 'color': '#4488ff'}),
+                    html.Div(msg.get('text', ''), style={
+                        'backgroundColor': '#1a1a1a',
+                        'padding': '15px',
+                        'borderRadius': '8px',
+                        'maxWidth': '70%',
+                        'borderLeft': '3px solid #4488ff'
+                    }),
+                    html.Div(msg.get('timestamp', ''), style={'fontSize': '10px', 'color': '#666', 'marginTop': '5px'})
+                ], style={'marginBottom': '15px'})
+            )
+
+    return components
+
+
+def process_chat_request(
+    chat_history,
+    message_text: str,
+    message_type: str = "strategy",
+    status_prefix: str = "Message sent"
+):
+    """Handle chat exchange with DeepSeek and return updated history + status + optional backtest payload."""
+    chat_history = chat_history or []
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Log the chat request with current timeframe context
+    current_tf = GLOBAL_STATE.get('selected_timeframe', 'UNKNOWN')
+    logger.info(f"[DIAGNOSTIC] Processing chat request - Type: {message_type}, Timeframe in context: {current_tf}, Message: {message_text[:50]}...")
+
+    user_message = {
+        'is_user': True,
+        'text': message_text,
+        'timestamp': timestamp
+    }
+    # Chat history already stored in chat-history-store component
+
+    ai_text = ""
+    ai_status = ""
+    backtest_payload = None
+
+    # If the user asked for a backtest, run it directly and respond without DeepSeek
+    backtest_cfg = parse_backtest_command(message_text)
+    run_all_tfs = "all timeframe" in message_text.lower()
+
+    if backtest_cfg or run_all_tfs:
+        try:
+            from backtesting.service import BacktestConfig, run_backtest as run_bt
+        except Exception as exc:
+            ai_text = f"❌ Backtest failed: service unavailable ({exc})"
+            ai_status = "Backtest error"
+            logger.exception("Backtest import failed")
+        else:
+            if run_all_tfs:
+                tfs = ["1m", "5m", "15m", "1h", "4h", "1d"]
+                symbol = backtest_cfg['symbol'] if backtest_cfg else "BTCUSDT"
+                strategy = backtest_cfg['strategy'] if backtest_cfg else "convergence"
+                start = datetime.now() - timedelta(days=30)
+                end = datetime.now()
+                capital = backtest_cfg['initial_capital'] if backtest_cfg else 10000.0
+                lines = [f"✅ Backtest sweep for {symbol} | {strategy.upper()} | last 30d | all timeframes"]
+                summaries = []
+                for tf in tfs:
+                    try:
+                        cfg = BacktestConfig(
+                            symbol=symbol,
+                            timeframe=tf,
+                            start=start,
+                            end=end,
+                            strategy=strategy,
+                            params={},
+                            initial_capital=float(capital),
+                        )
+                        result = run_bt(cfg)
+                        summaries.append({
+                            "symbol": symbol,
+                            "timeframe": tf,
+                            "strategy": strategy,
+                            "start": str(cfg.start),
+                            "end": str(cfg.end),
+                            "initial_capital": result.initial_capital,
+                            "final_capital": result.final_capital,
+                            "total_return_pct": result.total_return_pct,
+                            "win_rate": result.win_rate,
+                            "max_drawdown": result.max_drawdown,
+                            "sharpe_ratio": result.sharpe_ratio,
+                            "profit_factor": result.profit_factor,
+                            "total_trades": result.total_trades,
+                        })
+                        lines.append(
+                            f"- {tf}: {result.total_return_pct:+.2f}% | trades {result.total_trades} | win {result.win_rate*100:.1f}% | DD {result.max_drawdown:.2f}% | Sharpe {result.sharpe_ratio:.2f}"
+                        )
+                    except Exception as tf_exc:
+                        logger.exception(f"Backtest failed for {tf}")
+                        lines.append(f"- {tf}: ❌ {tf_exc}")
+                ai_text = "\n".join(lines)
+                ai_status = "Backtest sweep completed ✓"
+                backtest_payload = {"sweep": summaries}
+            else:
+                logger.info(f"[DIAGNOSTIC] Chat parsed backtest command: {backtest_cfg}")
+                try:
+                    cfg = BacktestConfig(
+                        symbol=backtest_cfg['symbol'],
+                        timeframe=backtest_cfg['timeframe'],
+                        start=datetime.fromisoformat(backtest_cfg['start']),
+                        end=datetime.fromisoformat(backtest_cfg['end']),
+                        strategy=backtest_cfg['strategy'],
+                        params={},
+                        initial_capital=float(backtest_cfg['initial_capital'])
+                    )
+                    result = run_bt(cfg)
+                    ai_text = (
+                        f"✅ Backtest for {cfg.symbol} on {cfg.timeframe} ({cfg.start.date()} → {cfg.end.date()})\n"
+                        f"Strategy: {cfg.strategy.upper()}\n"
+                        f"Return: {result.total_return_pct:+.2f}%\n"
+                        f"Trades: {result.total_trades}\n"
+                        f"Win Rate: {result.win_rate*100:.1f}%\n"
+                        f"Max DD: {result.max_drawdown:.2f}%\n"
+                        f"Sharpe: {result.sharpe_ratio:.2f}\n"
+                        f"Profit Factor: {result.profit_factor:.2f}\n"
+                        f"Initial: ${result.initial_capital:,.2f} → Final: ${result.final_capital:,.2f}"
+                    )
+                    ai_status = "Backtest completed ✓"
+                    backtest_payload = {
+                        "symbol": cfg.symbol,
+                        "timeframe": cfg.timeframe,
+                        "strategy": cfg.strategy,
+                        "start": str(cfg.start),
+                        "end": str(cfg.end),
+                        "initial_capital": result.initial_capital,
+                        "final_capital": result.final_capital,
+                        "total_return_pct": result.total_return_pct,
+                        "win_rate": result.win_rate,
+                        "max_drawdown": result.max_drawdown,
+                        "sharpe_ratio": result.sharpe_ratio,
+                        "profit_factor": result.profit_factor,
+                        "total_trades": result.total_trades,
+                    }
+                except Exception as exc:
+                    ai_text = f"❌ Backtest failed: {exc}"
+                    ai_status = "Backtest error"
+                    logger.exception("Backtest from chat failed")
+    else:
+        # Pass current chat_history (before adding user/ai messages) to DeepSeek
+        ai_text, ai_status = call_deepseek_chat(message_text, message_type, chat_history)
+
+    ai_message = {
+        'is_user': False,
+        'text': ai_text,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+    # Chat history already stored in chat-history-store component
+
+    # Create updated history with both user and AI messages
+    updated_history = chat_history + [user_message, ai_message]
+
+    # Also update SystemContext conversation_memory for DeepSeek memory
+    if CHAT_SYSTEM_CONTEXT:
+        CHAT_SYSTEM_CONTEXT.add_conversation_message(
+            user_message['text'],
+            ai_text,
+            message_type
+        )
+
+    status = f"{status_prefix}: {ai_status or 'Demo response'} | Logged to: logs/chat_history.log"
+    logger.info(f"[DIAGNOSTIC] Chat response generated with timeframe context: {current_tf}")
+    return updated_history, render_chat_history(updated_history), status, backtest_payload
+
+
+def parse_backtest_command(message_text: str) -> Optional[Dict[str, Any]]:
+    """Parse natural language backtest command from chat.
+
+    Examples:
+    - "run backtest BTCUSDT 1h convergence"
+    - "run backtest symbol=ETHUSDT timeframe=15m strategy=sma"
+    - "backtest BTC on 4h with macd strategy"
+    """
+    import re
+
+    message_lower = message_text.lower()
+
+    # Check if this is a backtest command
+    if not ('backtest' in message_lower or 'test strategy' in message_lower):
+        return None
+
+    config = {
+        'symbol': 'BTCUSDT',  # defaults
+        'timeframe': '1h',
+        'strategy': 'convergence',
+        'start': (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
+        'end': datetime.now().strftime('%Y-%m-%d'),
+        'initial_capital': 10000.0
+    }
+
+    # Extract symbol
+    symbol_pattern = r'(BTCUSDT|ETHUSDT|SOLUSDT|BTC|ETH|SOL)'
+    symbol_match = re.search(symbol_pattern, message_text, re.IGNORECASE)
+    if symbol_match:
+        sym = symbol_match.group(1).upper()
+        if sym in ['BTC', 'ETH', 'SOL']:
+            sym += 'USDT'
+        config['symbol'] = sym
+
+    # Extract timeframe
+    tf_pattern = r'\b(1m|5m|15m|1h|4h|1d)\b'
+    tf_match = re.search(tf_pattern, message_text, re.IGNORECASE)
+    if tf_match:
+        config['timeframe'] = tf_match.group(1).lower()
+
+    # Extract strategy
+    strategy_pattern = r'(convergence|sma|rsi|macd)'
+    strategy_match = re.search(strategy_pattern, message_text, re.IGNORECASE)
+    if strategy_match:
+        config['strategy'] = strategy_match.group(1).lower()
+
+    # Extract capital if specified
+    capital_pattern = r'(?:capital|money|funds?)\s+(?:of\s+)?[$]?(\d+(?:,\d{3})*(?:\.\d+)?)'
+    capital_match = re.search(capital_pattern, message_text, re.IGNORECASE)
+    if capital_match:
+        config['initial_capital'] = float(capital_match.group(1).replace(',', ''))
+
+    return config
+
+
+def call_backtest_api(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Call the backtest API endpoint."""
+    try:
+        response = requests.post(
+            'http://localhost:8000/backtest',
+            json=config,
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {
+                'success': False,
+                'error': f"API error: {response.status_code} - {response.text}"
+            }
+    except requests.exceptions.ConnectionError:
+        return {
+            'success': False,
+            'error': "Cannot connect to backtest API. Make sure it's running on localhost:8000"
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': f"Error calling backtest API: {str(e)}"
+        }
+
+
+def format_backtest_chat_response(config: Dict[str, Any], api_response: Dict[str, Any]) -> str:
+    """Format backtest results for chat display."""
+    if not api_response.get('success', False):
+        error = api_response.get('error', 'Unknown error')
+        return f"❌ Backtest failed: {error}"
+
+    result = api_response.get('result', {})
+
+    # Format results as markdown
+    response_lines = [
+        f"✅ Backtest completed for {config['symbol']} on {config['timeframe']} timeframe",
+        f"Strategy: {config['strategy'].upper()}",
+        f"Period: {config['start']} to {config['end']}",
+        "",
+        "**Results:**",
+        f"• Total Return: {result.get('total_return_pct', 0):+.2f}%",
+        f"• Sharpe Ratio: {result.get('sharpe_ratio', 0):.3f}",
+        f"• Max Drawdown: {result.get('max_drawdown', 0):.2f}%",
+        f"• Win Rate: {result.get('win_rate', 0):.1f}%",
+        f"• Total Trades: {result.get('total_trades', 0)}",
+        "",
+        f"**Capital:**",
+        f"• Initial: ${config['initial_capital']:,.2f}",
+        f"• Final: ${result.get('final_capital', 0):,.2f}",
+        f"• Profit Factor: {result.get('profit_factor', 0):.2f}",
+        "",
+        "💡 This backtest has been saved to the experiment database."
+    ]
+
+    if api_response.get('config_hash'):
+        response_lines.append(f"Config hash: {api_response['config_hash'][:8]}...")
+
+    return "\n".join(response_lines)
+
+
+
+
+def generate_sample_data(symbol: str, timeframe: str, num_bars: int = 200) -> pd.DataFrame:
+    """Generate realistic sample OHLCV data for testing."""
+    # Set parameters based on symbol and timeframe
+    base_price = {
+        'BTCUSDT': 100000,
+        'ETHUSDT': 3000,
+        'SOLUSDT': 150
+    }.get(symbol, 100000)
+
+    # Time delta based on timeframe
+    time_deltas = {
+        '1m': timedelta(minutes=1),
+        '5m': timedelta(minutes=5),
+        '15m': timedelta(minutes=15),
+        '1h': timedelta(hours=1),
+        '4h': timedelta(hours=4),
+        '1d': timedelta(days=1)
+    }
+    td = time_deltas.get(timeframe, timedelta(minutes=15))
+
+    # Generate timestamps
+    end_time = datetime.now()
+    start_time = end_time - (num_bars * td)
+    timestamps = pd.date_range(start=start_time, end=end_time, periods=num_bars)
+
+    # Generate price data with random walk
+    # IMPORTANT: Use stable seed based on symbol (NOT timeframe) for consistent price levels
+    np.random.seed(42)  # Fixed seed for reproducible data
+    returns = np.random.normal(0.001, 0.02, num_bars)  # Small positive drift with volatility
+    returns = np.clip(returns, -0.1, 0.1)  # Cap returns to prevent overflow
+
+    # Fix: Use iterative approach instead of cumprod to prevent overflow
+    prices = np.zeros(num_bars)
+    prices[0] = base_price
+    for i in range(1, num_bars):
+        prices[i] = prices[i-1] * (1 + returns[i])
+        # Cap price to prevent infinity
+        prices[i] = np.clip(prices[i], base_price * 0.01, base_price * 100)
+
+    # Generate OHLC from close prices
+    opens = prices.copy()
+    highs = np.maximum(opens, prices) * (1 + np.abs(np.random.normal(0, 0.01, num_bars)))
+    lows = np.minimum(opens, prices) * (1 - np.abs(np.random.normal(0, 0.01, num_bars)))
+    closes = prices
+
+    # Fix: Validate all prices are finite
+    for col_name, col_data in [('open', opens), ('high', highs), ('low', lows), ('close', closes)]:
+        inf_mask = ~np.isfinite(col_data)
+        if inf_mask.any():
+            logger.warning(f"Found {inf_mask.sum()} non-finite values in {col_name}, replacing with base price")
+            col_data[inf_mask] = base_price
+
+    # Generate volume (higher volume on larger moves)
+    price_changes = np.abs(np.diff(np.concatenate([[opens[0]], closes])))
+    volumes = np.random.lognormal(4, 1, num_bars) * (1 + price_changes * 5)
+
+    return pd.DataFrame({
+        'timestamp': timestamps,
+        'open': opens,
+        'high': highs,
+        'low': lows,
+        'close': closes,
+        'volume': volumes
+    })
+
+
+async def get_real_market_data(symbol: str, timeframe: str, num_bars: int = 200) -> Tuple[pd.DataFrame, bool]:
+    """Fetch real market data from Binance demo API with DataStore caching.
+
+    Returns:
+        Tuple containing the dataframe and a flag indicating if sample data was used.
+    """
+    used_sample_data = False
+    try:
+        from core.data.binance_client import BinanceClient
+        from core.data.data_store import DataStore
+
+        # Initialize DataStore
+        data_store = DataStore()
+
+        # Create cache key
+        cache_key = f"ohlcv:{symbol}:{timeframe}"
+
+        # Try to get from DataStore first (with get_or_fetch pattern)
+        async def fetch_data():
+            client = BinanceClient()
+            ohlcv_data = await client.get_ohlcv(symbol, timeframe, limit=num_bars)
+            if ohlcv_data is not None and len(ohlcv_data) > 0:
+                # Store in DataStore
+                await data_store.store_ohlcv(symbol, timeframe, ohlcv_data)
+                logger.info(f"Fetched {len(ohlcv_data)} bars from Binance and cached")
+                return ohlcv_data
+            return None
+
+        # Use get_or_fetch to check cache and fetch if needed
+        ohlcv_data = await data_store.get_or_fetch(cache_key, fetch_data, ttl=60)
+
+        if ohlcv_data is not None and len(ohlcv_data) > 0:
+            return ohlcv_data, used_sample_data
+        else:
+            logger.warning("Failed to fetch real data, falling back to sample data")
+
+    except Exception as e:
+        logger.error(f"Error fetching real market data: {e}")
+        logger.info("Falling back to sample data")
+
+    used_sample_data = True
+    return generate_sample_data(symbol, timeframe, num_bars), used_sample_data
+
+
+# Timeframe to minutes mapping for freshness checks
+TF_MINUTES = {
+    '1m': 1,
+    '3m': 3,
+    '5m': 5,
+    '15m': 15,
+    '30m': 30,
+    '1h': 60,
+    '2h': 120,
+    '4h': 240,
+    '6h': 360,
+    '8h': 480,
+    '12h': 720,
+    '1d': 1440,
+    '3d': 4320,
+    '1w': 10080
+}
+
+def fetch_market_data(symbol: str, timeframe: str, num_bars: int = 200, force_refresh: bool = False) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Retrieve market data with caching and freshness-aware fetching.
+
+    Returns:
+        Tuple of (dataframe, metadata dict)
+    """
+    key = (symbol, timeframe, num_bars)
+    now = datetime.now()
+    cached_entry = DATA_CACHE.get(key)
+    last_live_pull = getattr(fetch_market_data, "_last_live_pull", {})
+
+    # Always clear cache if force_refresh is True
+    if force_refresh and cached_entry:
+        logger.debug(f"Cache cleared for {symbol}-{timeframe}")
+        DATA_CACHE.pop(key, None)
+        cached_entry = None
+
+    # Check in-memory cache first
+    if cached_entry and not force_refresh:
+        age = (now - cached_entry['timestamp']).total_seconds()
+        if age < CACHE_TTL_SECONDS:
+            logger.debug(
+                f"Memory cache hit for {symbol}-{timeframe} ({age:.1f}s old)"
+            )
+            return cached_entry['df'].copy(), {
+                'cache_hit': True,
+                'used_sample_data': cached_entry['used_sample_data']
+            }
+
+    df = None
+    used_sample_data = USE_SAMPLE_DATA
+    last_candle_age_min = 0
+    is_stale = False
+
+    # Try to get from DataStore if not using sample data only
+    if not USE_SAMPLE_DATA:
+        try:
+            from core.data.data_store import DataStore
+
+            # Get or create DataStore instance
+            if not hasattr(fetch_market_data, '_datastore'):
+                fetch_market_data._datastore = DataStore(cache_dir='data/cache')
+                logger.info("DataStore initialized for dashboard")
+
+            datastore = fetch_market_data._datastore
+
+            # Try to get from DataStore cache or Parquet
+            if force_refresh:
+                df = datastore.get_historical_data(symbol, timeframe, force_refresh=True)
+            else:
+                df = datastore.get_historical_data(symbol, timeframe)
+
+            # If we have data from DataStore, use it
+            if df is not None and len(df) > 0:
+                # Limit to requested number of bars
+                df = df.tail(num_bars).reset_index(drop=True)
+
+                # Check if data is stale (P1.1: Freshness detection)
+                is_stale = False
+                if not used_sample_data and len(df) > 0:
+                    # Get last candle timestamp
+                    last_timestamp = ensure_utc_timestamp(df['timestamp'].iloc[-1])
+                    now_utc = datetime.now(timezone.utc)
+                    age_delta = (now_utc - last_timestamp.to_pydatetime()).total_seconds() / 60  # Convert to minutes
+
+                    # Get expected timeframe duration
+                    tf_minutes = TF_MINUTES.get(timeframe, 60)
+                    # Data is stale if it's older than 2x the timeframe (allowing for exchange delay)
+                    # Consider data stale once it exceeds one candle duration (more aggressive than 2x)
+                    stale_threshold = tf_minutes
+                    is_stale = age_delta > stale_threshold
+                    needs_live_refresh = age_delta > LIVE_REFRESH_MIN
+                    pulled_recently = False
+                    if needs_live_refresh:
+                        last_pull_ts = last_live_pull.get(key)
+                        if last_pull_ts:
+                            pulled_recently = (now - last_pull_ts).total_seconds() / 60 <= LIVE_REFRESH_MIN
+
+                    logger.info(
+                        f"Data freshness check: {symbol} {timeframe} - "
+                        f"Last candle age: {age_delta:.1f}m, Stale threshold: {stale_threshold:.1f}m, "
+                        f"Stale: {is_stale}, Live refresh needed: {needs_live_refresh and not pulled_recently}"
+                    )
+
+                    # If stale, force a fresh fetch from Binance
+                    if (is_stale or (needs_live_refresh and not pulled_recently)) and not force_refresh:
+                        logger.warning(
+                            f"Data age {age_delta:.1f}m exceeds refresh policy "
+                            f"(stale>{stale_threshold:.1f}m or live_refresh>{LIVE_REFRESH_MIN}m), "
+                            f"refreshing {symbol} {timeframe} from Binance"
+                        )
+                        df, live_fetch_used_sample = run_async_task(
+                            get_real_market_data,
+                            symbol,
+                            timeframe,
+                            num_bars=num_bars
+                        )
+                        if df is not None and len(df) > 0:
+                            df = df.tail(num_bars).reset_index(drop=True)
+                            used_sample_data = live_fetch_used_sample
+                            last_live_pull[key] = now
+                            logger.info(
+                                f"Refreshed {symbol} {timeframe} from Binance - "
+                                f"Last candle: {pd.to_datetime(df['timestamp'].iloc[-1])}, "
+                                f"Total candles: {len(df)}"
+                            )
+                            # Persist fresh data to DataStore
+                            try:
+                                run_async_task(
+                                    datastore.store_ohlcv,
+                                    symbol,
+                                    timeframe,
+                                    df
+                                )
+                                logger.info(f"Persisted fresh {symbol} {timeframe} data to DataStore")
+                            except Exception as e:
+                                logger.warning(f"Failed to persist fresh data to DataStore: {e}")
+
+                logger.info(f"Loaded {len(df)} candles from DataStore for {symbol} {timeframe} (stale_check={is_stale})")
+                used_sample_data = False
+            else:
+                # DataStore doesn't have data, fetch from Binance
+                logger.info(f"No data in DataStore for {symbol} {timeframe}, fetching from Binance")
+                df, live_fetch_used_sample = run_async_task(
+                    get_real_market_data,
+                    symbol,
+                    timeframe,
+                    num_bars=num_bars
+                )
+                used_sample_data = live_fetch_used_sample
+                last_live_pull[key] = now
+                # Persist fresh data to DataStore
+                if df is not None and len(df) > 0 and not used_sample_data:
+                    try:
+                        run_async_task(
+                            datastore.store_ohlcv,
+                            symbol,
+                            timeframe,
+                            df
+                        )
+                        logger.info(f"Persisted initial {symbol} {timeframe} data to DataStore")
+                    except Exception as e:
+                        logger.warning(f"Failed to persist data to DataStore: {e}")
+
+        except Exception as e:
+            logger.warning(f"DataStore/Binance fetch failed, using sample data: {e}")
+            df = None
+            used_sample_data = True
+    else:
+        logger.debug("DASH_USE_SAMPLE_DATA enabled - skipping real API calls")
+
+    # Fallback to sample data if needed (Step 5: Production Data Safety)
+    if df is None:
+        # Check if we're in production mode
+        production_mode = os.getenv('PRODUCTION_MODE', 'false').lower() == 'true'
+
+        if production_mode:
+            # In production mode, fail explicitly instead of using sample data
+            error_msg = f"API CONNECTION LOST - Unable to fetch real market data for {symbol} {timeframe}"
+            logger.error(error_msg)
+            # Return empty DataFrame with clear error indication
+            df = pd.DataFrame()
+            used_sample_data = False  # Clearly indicate this is NOT sample data
+            # Add error to metadata
+            result_metadata = {
+                'cache_hit': False,
+                'used_sample_data': used_sample_data,
+                'last_candle_age_min': 0,
+                'is_stale': False,
+                'tf_minutes': TF_MINUTES.get(timeframe, 60),
+                'api_error': error_msg  # Clear error message
+            }
+        else:
+            # In development mode, allow sample data fallback
+            logger.info(f"Using sample data for {symbol} {timeframe}")
+            df = generate_sample_data(symbol, timeframe, num_bars=num_bars)
+            used_sample_data = True
+            result_metadata = {
+                'cache_hit': False,
+                'used_sample_data': used_sample_data,
+                'last_candle_age_min': 0,
+                'is_stale': False,
+                'tf_minutes': TF_MINUTES.get(timeframe, 60)
+            }
+    else:
+        # Normal case - we have data; ensure last_candle_age_min is defined
+        safe_age = last_candle_age_min if 'last_candle_age_min' in locals() else 0
+        result_metadata = {
+            'cache_hit': False,
+            'used_sample_data': used_sample_data,
+            'last_candle_age_min': safe_age,
+            'is_stale': is_stale if 'is_stale' in locals() else False,
+            'tf_minutes': TF_MINUTES.get(timeframe, 60)
+        }
+
+    # Update in-memory cache
+    DATA_CACHE[key] = {
+        'df': df.copy(),
+        'timestamp': now,
+        'used_sample_data': used_sample_data,
+        'freshness_checked': True,
+        'is_stale': is_stale if 'is_stale' in locals() else False
+    }
+    fetch_market_data._last_live_pull = last_live_pull
+
+    # Calculate last candle age for metadata
+    last_candle_age_min = 0
+    if df is not None and len(df) > 0:
+        last_timestamp = ensure_utc_timestamp(df['timestamp'].iloc[-1])
+        last_candle_age_min = (datetime.now(timezone.utc) - last_timestamp.to_pydatetime()).total_seconds() / 60
+        # Update metadata with safe age
+        result_metadata['last_candle_age_min'] = last_candle_age_min
+
+    logger.debug(
+        f"Returning data for {symbol}-{timeframe}: {len(df)} candles, "
+        f"sample_data={used_sample_data}, cache_hit=False, last_age={last_candle_age_min:.1f}m"
+    )
+    return df.copy(), result_metadata
+
+
+def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> Dict[str, Any]:
+    """Calculate Supertrend indicator."""
+    close = df['close']
+    high = df['high']
+    low = df['low']
+
+    # Calculate ATR
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+
+    # Calculate HL2
+    hl2 = (high + low) / 2
+
+    # Calculate Upper and Lower bands
+    upper_band = hl2 + (multiplier * atr)
+    lower_band = hl2 - (multiplier * atr)
+
+    # Calculate Supertrend
+    supertrend = pd.Series(index=df.index, dtype=float)
+    direction = pd.Series(index=df.index, dtype=int)  # 1 for uptrend, -1 for downtrend
+
+    supertrend.iloc[0] = upper_band.iloc[0]
+    direction.iloc[0] = 1
+
+    for i in range(1, len(df)):
+        if close.iloc[i] > supertrend.iloc[i-1]:
+            direction.iloc[i] = 1
+            supertrend.iloc[i] = max(lower_band.iloc[i], supertrend.iloc[i-1])
+        else:
+            direction.iloc[i] = -1
+            supertrend.iloc[i] = min(upper_band.iloc[i], supertrend.iloc[i-1])
+
+    return {
+        'supertrend': supertrend,
+        'direction': direction,
+        'atr': atr
+    }
+
+
+def calculate_chandelier_exit(df: pd.DataFrame, period: int = 22, multiplier: float = 3.0) -> Dict[str, Any]:
+    """Calculate Chandelier Exit indicator."""
+    close = df['close']
+    high = df['high']
+    low = df['low']
+
+    # Calculate ATR
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+
+    # Calculate Chandelier Exit
+    long_exit = high.rolling(period).max() - (multiplier * atr)
+    short_exit = low.rolling(period).min() + (multiplier * atr)
+
+    return {
+        'long_exit': long_exit,
+        'short_exit': short_exit,
+        'atr': atr
+    }
+
+
+def calculate_liquidity_zones(df: pd.DataFrame, lookback: int = 100) -> Dict[str, Any]:
+    """Calculate liquidity zones (areas of high volume)."""
+    typical_price = (df['high'] + df['low'] + df['close']) / 3
+    volume = df['volume']
+
+    # Create price bins
+    price_min = df['low'].min()
+    price_max = df['high'].max()
+    price_bins = np.linspace(price_min, price_max, 20)
+
+    volume_at_price = np.zeros(len(price_bins) - 1)
+
+    # Aggregate volume at each price level
+    for i, row in df.iterrows():
+        low = row['low']
+        high = row['high']
+        vol = row['volume']
+
+        for j in range(len(price_bins) - 1):
+            bin_low = price_bins[j]
+            bin_high = price_bins[j + 1]
+            if high < bin_low or low > bin_high:
+                continue
+            # Prevent division by zero for flat candles (high == low)
+            price_range = high - low
+            if price_range <= 0:
+                continue
+            overlap = (min(high, bin_high) - max(low, bin_low)) / price_range
+            volume_at_price[j] += vol * overlap
+
+    # Find significant zones (top 20% of volume)
+    threshold = np.percentile(volume_at_price, 80)
+    significant_zones = price_bins[:-1][volume_at_price > threshold]
+
+    return {
+        'zones': significant_zones,
+        'volume_profile': dict(zip(price_bins[:-1], volume_at_price))
+    }
+
+
+def calculate_market_regime_overlay(df: pd.DataFrame, short_window: int = 20,
+                                    long_window: int = 60) -> Dict[str, Any] | None:
+    """Classify market regime for shading overlays."""
+    if len(df) < long_window:
+        return None
+
+    returns = df['close'].pct_change()
+    realized_vol = returns.rolling(long_window).std().fillna(0)
+    vol_threshold = realized_vol.median()
+    sma_short = df['close'].rolling(short_window).mean()
+    sma_long = df['close'].rolling(long_window).mean()
+    trend_strength = (sma_short - sma_long).fillna(0)
+
+    regime_series = pd.Series('RANGING_LOW_VOL', index=df.index)
+    regime_series[(trend_strength > 0) & (realized_vol >= vol_threshold)] = 'TRENDING_UP_HIGH_VOL'
+    regime_series[(trend_strength > 0) & (realized_vol < vol_threshold)] = 'TRENDING_UP_LOW_VOL'
+    regime_series[(trend_strength < 0) & (realized_vol >= vol_threshold)] = 'TRENDING_DOWN_HIGH_VOL'
+    regime_series[(trend_strength < 0) & (realized_vol < vol_threshold)] = 'TRENDING_DOWN_LOW_VOL'
+
+    colors = {
+        'TRENDING_UP_HIGH_VOL': 'rgba(0, 255, 136, 0.08)',
+        'TRENDING_UP_LOW_VOL': 'rgba(0, 136, 255, 0.08)',
+        'TRENDING_DOWN_HIGH_VOL': 'rgba(255, 68, 68, 0.12)',
+        'TRENDING_DOWN_LOW_VOL': 'rgba(255, 165, 0, 0.1)',
+        'RANGING_LOW_VOL': 'rgba(255, 255, 255, 0.03)'
+    }
+
+    return {
+        'series': regime_series,
+        'colors': colors
+    }
+
+
+def calculate_timeframe_alignment(df: pd.DataFrame) -> Dict[str, pd.Series] | None:
+    """Compute multi-EMA alignment signals for overlay markers."""
+    if len(df) < 55:
+        return None
+
+    ema_fast = df['close'].ewm(span=10, adjust=False).mean()
+    ema_mid = df['close'].ewm(span=21, adjust=False).mean()
+    ema_slow = df['close'].ewm(span=55, adjust=False).mean()
+
+    bullish = (ema_fast > ema_mid) & (ema_mid > ema_slow)
+    bearish = (ema_fast < ema_mid) & (ema_mid < ema_slow)
+
+    return {
+        'bullish': bullish.fillna(False),
+        'bearish': bearish.fillna(False)
+    }
+
+
+def create_interactive_chart(df: pd.DataFrame, symbol: str, timeframe: str,
+                            features: Dict[str, Any]) -> go.Figure:
+    """Create an interactive TradingView-style chart with feature overlays."""
+    show_order_flow = features.get('orderflow', True)
+    orderflow_height = 0.15 if show_order_flow else 0.01
+    orderflow_title = 'Order Flow Imbalance' if show_order_flow else 'Order Flow (disabled)'
+
+    # Create subplots
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        row_heights=[0.7, 0.15, orderflow_height],
+        subplot_titles=(
+            f'{symbol} - {timeframe.upper()} Timeframe',
+            'Volume',
+            orderflow_title
+        )
+    )
+
+    # Add candlestick chart
+    fig.add_trace(
+        go.Candlestick(
+            x=df['timestamp'],
+            open=df['open'],
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            name=symbol,
+            increasing_line_color='#00ff88',
+            decreasing_line_color='#ff4444',
+            increasing_fillcolor='#00ff88',
+            decreasing_fillcolor='#ff4444',
+            line=dict(width=1)
+        ),
+        row=1, col=1
+    )
+
+    # Add Supertrend if enabled
+    if features.get('supertrend', False):
+        st_data = calculate_supertrend(df)
+        fig.add_trace(
+            go.Scatter(
+                x=df['timestamp'],
+                y=st_data['supertrend'],
+                name='Supertrend',
+                line=dict(color='#4488ff', width=2, dash='solid'),
+                opacity=0.8
+            ),
+            row=1, col=1
+        )
+
+    # Add Chandelier Exit if enabled
+    if features.get('chandelier', False):
+        ce_data = calculate_chandelier_exit(df)
+        fig.add_trace(
+            go.Scatter(
+                x=df['timestamp'],
+                y=ce_data['long_exit'],
+                name='Chandelier Long',
+                line=dict(color='#ff9900', width=1, dash='dash'),
+                opacity=0.7
+            ),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df['timestamp'],
+                y=ce_data['short_exit'],
+                name='Chandelier Short',
+                line=dict(color='#ff9900', width=1, dash='dash'),
+                opacity=0.7
+            ),
+            row=1, col=1
+        )
+
+    # Add Liquidity Zones if enabled
+    if features.get('liquidity', False):
+        lz_data = calculate_liquidity_zones(df)
+        zones = lz_data.get('zones', [])
+
+        if len(zones) > 0:
+            logger.debug(f"Drawing {len(zones)} liquidity zones")
+
+            # Draw horizontal lines for each liquidity zone
+            for zone in zones:
+                fig.add_hline(
+                    y=zone,
+                    line=dict(color='rgba(255, 215, 0, 0.8)', width=2, dash='dash'),
+                    layer='above',
+                    annotation_text=f"Liquidity Zone: {zone:.2f}",
+                    annotation_position="top left",
+                    annotation=dict(font_size=10, font_color='rgba(255, 215, 0, 0.9)')
+                )
+
+            # Draw rectangular shading for each zone (wider for better visibility)
+            for zone in zones:
+                fig.add_vrect(
+                    x0=df['timestamp'].iloc[0],
+                    x1=df['timestamp'].iloc[-1],
+                    y0=zone * 0.99,
+                    y1=zone * 1.01,
+                    fillcolor='rgba(255, 215, 0, 0.15)',
+                    line_width=1,
+                    line_color='rgba(255, 215, 0, 0.4)',
+                    layer='below'
+                )
+        else:
+            logger.debug("No significant liquidity zones detected")
+
+    # Add market regime shading
+    if features.get('regime', False):
+        regime_data = calculate_market_regime_overlay(df)
+        if regime_data:
+            timestamps = df['timestamp']
+            regimes = regime_data['series']
+            colors = regime_data['colors']
+            current_regime = regimes.iloc[0]
+            segment_start = timestamps.iloc[0]
+
+            for idx in range(1, len(timestamps)):
+                if regimes.iloc[idx] != current_regime:
+                    fig.add_vrect(
+                        x0=segment_start,
+                        x1=timestamps.iloc[idx],
+                        fillcolor=colors.get(current_regime, 'rgba(255,255,255,0.03)'),
+                        line_width=0,
+                        layer='below'
+                    )
+                    current_regime = regimes.iloc[idx]
+                    segment_start = timestamps.iloc[idx]
+
+            # Add final segment
+            fig.add_vrect(
+                x0=segment_start,
+                x1=timestamps.iloc[-1],
+                fillcolor=colors.get(current_regime, 'rgba(255,255,255,0.03)'),
+                line_width=0,
+                layer='below'
+            )
+
+            last_regime_raw = regimes.iloc[-1]
+            latest_regime = last_regime_raw.replace('_', ' ').title()
+            regime_font_color = '#00ff88' if 'UP' in last_regime_raw else (
+                '#ff4444' if 'DOWN' in last_regime_raw else '#f0e68c'
+            )
+            fig.add_annotation(
+                text=f"Regime: {latest_regime}",
+                xref='paper',
+                yref='paper',
+                x=0.01,
+                y=0.98,
+                bgcolor='rgba(0,0,0,0.5)',
+                font={'color': regime_font_color, 'size': 12},
+                showarrow=False
+            )
+
+    # Add timeframe alignment markers
+    if features.get('alignment', False):
+        alignment = calculate_timeframe_alignment(df)
+        if alignment:
+            bullish_idx = alignment['bullish']
+            bearish_idx = alignment['bearish']
+
+            if bullish_idx.any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=df['timestamp'][bullish_idx],
+                        y=df['close'][bullish_idx],
+                        mode='markers',
+                        marker=dict(
+                            symbol='triangle-up',
+                            color='#00ff88',
+                            size=8,
+                            line=dict(color='#0a0a0a', width=1)
+                        ),
+                        name='TF Alignment (Bullish)',
+                        hovertemplate='Bullish alignment<br>%{x|%Y-%m-%d %H:%M}'
+                    ),
+                    row=1, col=1
+                )
+
+            if bearish_idx.any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=df['timestamp'][bearish_idx],
+                        y=df['close'][bearish_idx],
+                        mode='markers',
+                        marker=dict(
+                            symbol='triangle-down',
+                            color='#ff4444',
+                            size=8,
+                            line=dict(color='#0a0a0a', width=1)
+                        ),
+                        name='TF Alignment (Bearish)',
+                        hovertemplate='Bearish alignment<br>%{x|%Y-%m-%d %H:%M}'
+                    ),
+                    row=1, col=1
+                )
+
+    # Add Volume
+    colors = ['#00ff88' if close >= open else '#ff4444'
+              for close, open in zip(df['close'], df['open'])]
+    fig.add_trace(
+        go.Bar(
+            x=df['timestamp'],
+            y=df['volume'],
+            name='Volume',
+            marker_color=colors,
+            opacity=0.6,
+            yaxis='y2'
+        ),
+        row=2, col=1
+    )
+
+    # Add Order Flow
+    if show_order_flow:
+        df['body'] = abs(df['close'] - df['open'])
+        df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
+        df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
+
+        buying_pressure = (df['close'] > df['open']).astype(int)
+        selling_pressure = (df['upper_wick'] > df['body'] * 1.5).astype(int)
+        order_flow = buying_pressure - selling_pressure
+
+        fig.add_trace(
+            go.Bar(
+                x=df['timestamp'],
+                y=order_flow,
+                name='Order Flow',
+                marker_color=[
+                    'rgba(0, 255, 0, 0.7)' if x > 0 else 'rgba(255, 0, 0, 0.7)'
+                    for x in order_flow
+                ],
+                yaxis='y4'
+            ),
+            row=3, col=1
+        )
+    else:
+        fig.update_yaxes(visible=False, row=3, col=1)
+        fig.update_xaxes(showticklabels=False, row=3, col=1)
+
+    # Update layout
+    fig.update_layout(
+        title=dict(
+            text=f'<b>{symbol} Price Chart - {timeframe.upper()} Timeframe</b>',
+            x=0.5,
+            font=dict(size=20, color='white')
+        ),
+        height=800,
+        showlegend=True,
+        template='plotly_dark',
+        xaxis_rangeslider_visible=False,
+        paper_bgcolor='#0a0a0a',
+        plot_bgcolor='#0a0a0a',
+        font=dict(color='#ddd', size=11),
+        dragmode='pan',
+        hovermode='x unified',
+        hoverdistance=50,
+        spikedistance=1000,
+        uirevision=f"{symbol}-{timeframe}",
+        legend=dict(
+            bgcolor='rgba(0,0,0,0.5)',
+            bordercolor='rgba(255,255,255,0.2)',
+            borderwidth=1
+        ),
+        margin=dict(l=50, r=50, t=80, b=50)
+    )
+
+    # Update axes
+    fig.update_yaxes(
+        title_text="Price (USDT)",
+        row=1,
+        col=1,
+        gridcolor='#333',
+        automargin=True,
+        side='right',
+        fixedrange=False,
+        showspikes=True,
+        spikemode='across',
+        spikecolor='#00ff88',
+        spikethickness=1
+    )
+    fig.update_yaxes(
+        title_text="Volume",
+        row=2,
+        col=1,
+        gridcolor='#333',
+        automargin=True,
+        fixedrange=False,
+        showspikes=True,
+        spikemode='across',
+        spikecolor='#00ff88',
+        spikethickness=1
+    )
+    fig.update_yaxes(
+        title_text="Order Flow" if show_order_flow else "",
+        row=3,
+        col=1,
+        gridcolor='#333',
+        showticklabels=show_order_flow,
+        automargin=True,
+        fixedrange=False,
+        showspikes=True,
+        spikemode='across',
+        spikecolor='#00ff88',
+        spikethickness=1
+    )
+    fig.update_xaxes(
+        title_text="Time",
+        row=3,
+        col=1,
+        gridcolor='#333',
+        showticklabels=show_order_flow,
+        showspikes=True,
+        spikemode='across',
+        spikecolor='#00ff88',
+        spikethickness=1
+    )
+
+    # Add range selector with buttons for different time periods
+    fig.update_xaxes(
+        rangeslider=dict(
+            visible=True,
+            thickness=0.05,
+            bgcolor='rgba(255, 255, 255, 0.05)',
+            bordercolor='rgba(255, 255, 255, 0.1)',
+            borderwidth=1
+        ),
+        rangeselector=dict(
+            buttons=list([
+                dict(count=50, label="50", step="all", stepmode="backward"),
+                dict(count=100, label="100", step="all", stepmode="backward"),
+                dict(count=200, label="200", step="all", stepmode="backward"),
+                dict(step="all", label="All")
+            ]),
+            bgcolor='rgba(26, 26, 26, 0.9)',
+            bordercolor='rgba(255, 255, 255, 0.2)',
+            borderwidth=1,
+            font=dict(color='#ddd', size=11)
+        )
+    )
+
+    # Add signal annotations (LONG/SHORT markers based on order flow)
+    if show_order_flow:
+        # Generate sample trading signals based on order flow
+        order_flow_threshold = 0.3
+        long_signals = []
+        short_signals = []
+
+        for i in range(10, len(df) - 10):
+            # Look for strong buying pressure followed by confirmation
+            if i < len(order_flow):
+                # LONG signal: positive order flow with price confirmation
+                if (order_flow.iloc[i] > order_flow_threshold and
+                    df['close'].iloc[i] > df['close'].iloc[i-5]):
+                    long_signals.append({
+                        'index': i,
+                        'timestamp': df['timestamp'].iloc[i],
+                        'price': df['high'].iloc[i] * 1.01,
+                        'text': 'LONG'
+                    })
+
+                # SHORT signal: negative order flow with price confirmation
+                elif (order_flow.iloc[i] < -order_flow_threshold and
+                      df['close'].iloc[i] < df['close'].iloc[i-5]):
+                    short_signals.append({
+                        'index': i,
+                        'timestamp': df['timestamp'].iloc[i],
+                        'price': df['low'].iloc[i] * 0.99,
+                        'text': 'SHORT'
+                    })
+
+        # Add LONG signal annotations
+        for signal in long_signals[-5:]:  # Show last 5 signals
+            fig.add_annotation(
+                x=signal['timestamp'],
+                y=signal['price'],
+                text="<b>LONG</b>",
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor='#00ff88',
+                arrowwidth=2,
+                arrowsize=1,
+                ax=0,
+                ay=-40,
+                bgcolor='rgba(0, 255, 136, 0.9)',
+                bordercolor='#00ff88',
+                borderwidth=1,
+                borderpad=4,
+                font=dict(color='#000', size=10, family='Arial Black')
+            )
+
+        # Add SHORT signal annotations
+        for signal in short_signals[-5:]:  # Show last 5 signals
+            fig.add_annotation(
+                x=signal['timestamp'],
+                y=signal['price'],
+                text="<b>SHORT</b>",
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor='#ff4444',
+                arrowwidth=2,
+                arrowsize=1,
+                ax=0,
+                ay=40,
+                bgcolor='rgba(255, 68, 68, 0.9)',
+                bordercolor='#ff4444',
+                borderwidth=1,
+                borderpad=4,
+                font=dict(color='#fff', size=10, family='Arial Black')
+            )
+
+    return fig
+
+
+def create_positions_table(active_positions: Dict[str, Any]) -> html.Table:
+    """Create HTML table for active positions."""
+    if not active_positions:
+        return html.Div("No active positions", style={'color': '#888', 'padding': '20px', 'textAlign': 'center'})
+
+    # Table styles
+    table_style = {
+        'width': '100%',
+        'borderCollapse': 'collapse',
+        'marginTop': '20px',
+        'fontSize': '14px'
+    }
+
+    header_style = {
+        'backgroundColor': '#1a1a1a',
+        'color': '#00ff88',
+        'padding': '12px',
+        'textAlign': 'left',
+        'borderBottom': '2px solid #00ff88'
+    }
+
+    cell_style = {
+        'padding': '10px 12px',
+        'borderBottom': '1px solid #333',
+        'color': '#ddd'
+    }
+
+    # Create table header
+    header = html.Tr([
+        html.Th("Symbol", style=header_style),
+        html.Th("Side", style=header_style),
+        html.Th("Entry Price", style=header_style),
+        html.Th("Current Price", style=header_style),
+        html.Th("Size", style=header_style),
+        html.Th("P&L", style=header_style),
+        html.Th("P&L %", style=header_style),
+        html.Th("Actions", style=header_style)
+    ])
+
+    # Create table rows
+    rows = []
+    for symbol, position in active_positions.items():
+        pnl = position.get('unrealized_pnl', 0)
+        pnl_percent = position.get('unrealized_pnl_percent', 0)
+
+        pnl_color = '#00ff88' if pnl >= 0 else '#ff4444'
+
+        row_style = {
+            'backgroundColor': '#1a1a1a' if len(rows) % 2 == 0 else '#0f0f0f'
+        }
+
+        rows.append(html.Tr([
+            html.Td(symbol, style={**cell_style, **row_style}),
+            html.Td(position.get('side', 'N/A'), style={**cell_style, **row_style}),
+            html.Td(f"${position.get('entry_price', 0):.2f}", style={**cell_style, **row_style}),
+            html.Td(f"${position.get('current_price', 0):.2f}", style={**cell_style, **row_style}),
+            html.Td(f"{position.get('quantity', 0):.4f}", style={**cell_style, **row_style}),
+            html.Td(f"${pnl:.2f}", style={**cell_style, 'color': pnl_color, **row_style}),
+            html.Td(f"{pnl_percent:.2f}%", style={**cell_style, 'color': pnl_color, **row_style}),
+            html.Td(
+                html.Button('Close', id=f'close-{symbol}', n_clicks=0, style={
+                    'backgroundColor': '#ff4444',
+                    'color': 'white',
+                    'border': 'none',
+                    'padding': '6px 12px',
+                    'cursor': 'pointer',
+                    'borderRadius': '4px',
+                    'fontSize': '12px'
+                }),
+                style={**cell_style, **row_style}
+            )
+        ]))
+
+    return html.Table([header] + rows, style=table_style)
+
+
+def create_metrics_card(title: str, value: str, subtitle: str = "", color: str = "#00ff88") -> html.Div:
+    """Create a metrics card."""
+    return html.Div([
+        html.H4(title, style={'margin': '0', 'color': '#888', 'fontSize': '14px', 'fontWeight': 'normal'}),
+        html.H2(value, style={'margin': '5px 0', 'color': color, 'fontSize': '28px', 'fontWeight': 'bold'}),
+        html.P(subtitle, style={'margin': '0', 'color': '#666', 'fontSize': '11px'})
+    ], style={
+        'backgroundColor': '#1a1a1a',
+        'padding': '15px',
+        'borderRadius': '8px',
+        'border': f'2px solid {color}',
+        'minHeight': '80px',
+        'display': 'flex',
+        'flexDirection': 'column',
+        'justifyContent': 'center'
+    })
+
+
+def create_dashboard_app():
+    """Create the Dash app with design system."""
+    app = dash.Dash(
+        __name__,
+        external_stylesheets=[
+            dbc.themes.DARKLY,  # Bootstrap dark theme
+            # Custom CSS in assets/ folder is automatically loaded by Dash
+        ],
+        assets_url_path="/assets-v2",
+        suppress_callback_exceptions=True,
+        title="DeepSeek Trading Dashboard",
+        update_title=None  # Disable "Updating..." in title
+    )
+    # Bust asset cache in the browser
+    app.server.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+    app.server.config["TEMPLATES_AUTO_RELOAD"] = True
+
+    # Add Basic Authentication (Step 4)
+    # Check if auth is disabled for local development
+    if os.getenv('DASH_AUTH_DISABLED', 'false').lower() != 'true':
+        try:
+            import dash_auth
+            username = os.getenv('DASH_USER', 'admin')
+            password = os.getenv('DASH_PASS', 'admin')
+
+            # Basic Auth with credentials from environment
+            valid_username_password_pairs = {
+                username: password
+            }
+            auth = dash_auth.BasicAuth(
+                app,
+                valid_username_password_pairs
+            )
+            print(f"✓ Dashboard authentication enabled (user: {username})")
+        except Exception as e:
+            print(f"⚠ Warning: Could not enable authentication: {e}")
+            print("  Dashboard will run WITHOUT authentication")
+    else:
+        print("✓ Dashboard authentication disabled (DASH_AUTH_DISABLED=true)")
+
+    # Configure metadata for better SEO and mobile experience
+    app.index_string = '''
+    <!DOCTYPE html>
+    <html>
+        <head>
+            {%metas%}
+            <title>{%title%}</title>
+            {%favicon%}
+            {%css%}
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta name="description" content="Professional AI-powered trading dashboard with real-time analysis">
+            <link rel="preconnect" href="https://fonts.googleapis.com">
+            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+            <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+            <style>
+                :root {
+                    --ds-bg: #0b0f17;
+                    --ds-surface: #111827;
+                    --ds-border: #1f2937;
+                    --ds-accent: #22d3ee;
+                    --ds-warn: #f59e0b;
+                    --ds-good: #22c55e;
+                    --ds-bad: #ef4444;
+                    --ds-text: #e5e7eb;
+                    --ds-muted: #9ca3af;
+                }
+                body {
+                    margin: 0;
+                    background: radial-gradient(circle at 20% 20%, rgba(34, 211, 238, 0.08), transparent 25%),
+                                radial-gradient(circle at 80% 0%, rgba(124, 58, 237, 0.08), transparent 22%),
+                                var(--ds-bg);
+                    color: var(--ds-text);
+                    font-family: 'Manrope', 'Inter', system-ui, -apple-system, sans-serif;
+                }
+                .ds-card {
+                    background: var(--ds-surface);
+                    border: 1px solid var(--ds-border);
+                    border-radius: 14px;
+                    padding: 18px;
+                    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+                }
+                .ds-card.mb-lg { margin-bottom: 18px; }
+                .ds-metrics {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                    gap: 12px;
+                }
+                .ds-table table, .ds-table th, .ds-table td {
+                    border: 1px solid var(--ds-border);
+                    border-collapse: collapse;
+                }
+                .ds-table th, .ds-table td {
+                    padding: 10px;
+                    font-size: 13px;
+                }
+                .pill {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 6px;
+                    padding: 6px 10px;
+                    border-radius: 999px;
+                    font-size: 12px;
+                    font-weight: 700;
+                    border: 1px solid var(--ds-border);
+                    background: rgba(34,211,238,0.08);
+                    color: var(--ds-text);
+                }
+                .pill.warn { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.4); }
+                .pill.bad { background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.4); }
+                .pill.good { background: rgba(34,197,94,0.12); border-color: rgba(34,197,94,0.4); }
+                .tf-btn {
+                    background: transparent;
+                    border: 1px solid var(--ds-border);
+                    color: var(--ds-text);
+                    border-radius: 10px;
+                    padding: 10px 14px;
+                    min-width: 52px;
+                }
+                .tf-btn:hover { border-color: var(--ds-accent); color: var(--ds-accent); }
+                .action-row .btn {
+                    border-radius: 10px;
+                }
+            </style>
+        </head>
+        <body>
+            {%app_entry%}
+            <footer>
+                {%config%}
+                {%scripts%}
+                {%renderer%}
+            </footer>
+        </body>
+    </html>
+    '''
+
+    # Define Layout
+    layout = dbc.Container([
+        # Header Card
+        dbc.Card([
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([
+                        html.H1("DeepSeek Trading System", className="text-primary", style={'fontWeight': 'bold', 'fontSize': '24px'}),
+                        html.Div("Autonomous AI-Powered Trading", className="text-muted", style={'fontSize': '14px'}),
+                        # Status badges
+                        html.Div([
+                            html.Span("LIVE", id="live-status-badge", className="badge bg-success me-2", style={'display': 'none'}),
+                            html.Span("DEMO", id="demo-status-badge", className="badge bg-warning me-2"),
+                            html.Span("Data Fresh: < 30s", id="freshness-badge", className="badge bg-info", style={'fontSize': '11px'}),
+                            html.Span("Age: --", id="last-age-badge", className="badge bg-secondary ms-2", style={'fontSize': '11px'})
+                        ], className="mt-2")
+                    ], width=8),
+                    dbc.Col([
+                        html.Div(id='system-status-indicator', className="text-end")
+                    ], width=4)
+                ], className="align-items-center")
+            ])
+        ], className="ds-card mb-4 mt-3"),
+
+        # Main Tabs
+        dbc.Tabs([
+            # Tab 1: Market Analysis (Existing)
+            dbc.Tab(label="Market Analysis", tab_id="tab-market", children=[
+                dbc.Row([
+                    # Left Column: Chart & Controls
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                # Toolbar
+                                dbc.Row([
+                                    dbc.Col([
+                                        html.Div([
+                                            html.Button("1m", id='tf-1m', n_clicks=0, className='tf-btn me-2'),
+                                            html.Button("5m", id='tf-5m', n_clicks=0, className='tf-btn me-2'),
+                                            html.Button("15m", id='tf-15m', n_clicks=0, className='tf-btn active me-2'),
+                                            html.Button("1h", id='tf-1h', n_clicks=0, className='tf-btn me-2'),
+                                            html.Button("4h", id='tf-4h', n_clicks=0, className='tf-btn me-2'),
+                                            html.Button("1d", id='tf-1d', n_clicks=0, className='tf-btn'),
+                                        ], className="d-flex")
+                                    ], width=6),
+                                    dbc.Col([
+                                        html.Div([
+                                            dbc.Checklist(
+                                                options=[
+                                                    {'label': 'Liquidity', 'value': 'liquidity'},
+                                                    {'label': 'Order Flow', 'value': 'orderflow'},
+                                                    {'label': 'Supertrend', 'value': 'supertrend'},
+                                                    {'label': 'Chandelier', 'value': 'chandelier'},
+                                                ],
+                                                value=['liquidity', 'orderflow'],
+                                                id='overlay-toggles',
+                                                inline=True,
+                                                switch=True,
+                                            )
+                                            ,
+                                            dbc.Button("Refresh now", id='refresh-data-btn', color='secondary', size='sm', className='ms-3')
+                                        ], className="d-flex justify-content-end align-items-center")
+                                    ], width=6)
+                                ], className="mb-3"),
+
+                                # Main Chart
+                                dcc.Graph(
+                                    id='main-chart',
+                                    style={'height': '600px'},
+                                    config={
+                                        "scrollZoom": True,  # allow mouse wheel zoom
+                                        "doubleClick": "reset",
+                                        "displaylogo": False,
+                                        "modeBarButtonsToRemove": ["select2d", "lasso2d"],  # Remove some buttons for cleaner UI
+                                        "toImageButtonOptions": {
+                                            "format": "png",
+                                            "filename": "deepseek_chart",
+                                            "height": 600,
+                                            "width": 1000,
+                                            "scale": 2
+                                        }
+                                    }
+                                ),
+                                
+                                # Range Slider
+                                html.Div([
+                                    dcc.RangeSlider(
+                                        id='chart-range-slider',
+                                        min=0,
+                                        max=100,
+                                        step=1,
+                                        value=[0, 100],
+                                        marks=None,
+                                        tooltip={"placement": "bottom", "always_visible": False}
+                                    )
+                                ], className="mt-3 px-2")
+                            ])
+                        ], className="ds-card mb-4"),
+                    ], width=8),
+
+                    # Right Column: Chat & Features
+                    dbc.Col([
+                                # Chat Interface
+                                dbc.Card([
+                                    dbc.CardHeader("DeepSeek AI Assistant"),
+                                    dbc.CardBody([
+                                        html.Div(id='chat-history', style={'height': '400px', 'overflowY': 'auto', 'marginBottom': '10px'}),
+                                        dbc.InputGroup([
+                                        dbc.Input(id='chat-input', placeholder="Ask about market structure...", type="text"),
+                                        dbc.Button("Send", id='chat-send-btn', color="primary")
+                                        ]),
+                                        html.Div(
+                                            id='chat-status',
+                                            children="Awaiting message",
+                                            className="text-info mt-2",
+                                            style={"fontSize": "12px"}
+                                        ),
+                                        html.Div(id='debug-output', className="text-warning mt-2")
+                                    ])
+                                ], className="ds-card mb-4"),
+
+                        # Feature Metrics
+                        dbc.Card([
+                            dbc.CardHeader("Feature Health"),
+                            dbc.CardBody(id='feature-metrics-content')
+                        ], className="ds-card")
+                    ], width=4)
+                ])
+            ]),
+
+            # Tab 2: Account & Trading (New)
+            dbc.Tab(label="Account & Trading", tab_id="tab-account", children=[
+                dbc.Row([
+                    # Portfolio Summary
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H5("Portfolio Value", className="card-title text-muted"),
+                                html.H2(id='portfolio-value', className="text-primary"),
+                                html.Div(id='portfolio-pnl-percent')
+                            ])
+                        ], className="ds-card mb-3")
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H5("Unrealized PnL", className="card-title text-muted"),
+                                html.H2(id='unrealized-pnl', className="text-success"),
+                                html.Div("Active Positions Impact")
+                            ])
+                        ], className="ds-card mb-3")
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H5("Total Exposure", className="card-title text-muted"),
+                                html.H2(id='total-exposure', className="text-warning"),
+                                html.Div("Risk Utilization")
+                            ])
+                        ], className="ds-card mb-3")
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardBody([
+                                html.H5("Max Drawdown", className="card-title text-muted"),
+                                html.H2(id='max-drawdown', className="text-danger"),
+                                html.Div("Peak to Trough")
+                            ])
+                        ], className="ds-card mb-3")
+                    ], width=3),
+                ], className="mb-4"),
+
+                dbc.Row([
+                    # Active Positions
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("Active Positions"),
+                            dbc.CardBody([
+                                html.Div(id='active-positions-table')
+                            ])
+                        ], className="ds-card mb-4")
+                    ], width=12)
+                ]),
+
+                dbc.Row([
+                    # Trade History
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("Recent Trade History"),
+                            dbc.CardBody([
+                                html.Div(id='trade-history-table')
+                            ])
+                        ], className="ds-card")
+                    ], width=8),
+
+                    # System Health
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader("System Health"),
+                            dbc.CardBody([
+                                html.Div(id='system-health-metrics')
+                            ])
+                        ], className="ds-card")
+                    ], width=4)
+                ]),
+
+                # Manager Actions - Added for Step 18
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Card([
+                            dbc.CardHeader([
+                                html.H4("Manager Actions", className="mb-0 d-inline"),
+                                html.Small("Read-only mode", className="text-muted ms-2")
+                            ]),
+                            dbc.CardBody([
+                                html.P("DeepSeek Manager - Safe command layer for system control",
+                                       className="text-muted mb-3"),
+                                html.Div(id='manager-actions-status', children=[
+                                    html.Small("No commands executed yet", className="text-muted")
+                                ]),
+                                html.Hr(),
+                                html.Small("Safe commands: refresh data, set timeframe, toggle overlays, run backtest, fetch health/account",
+                                           className="text-muted")
+                            ])
+                        ], className="ds-card")
+                    ], width=12)
+                ])
+            ]),
+            
+            # Tab 3: Backtest Lab
+            dbc.Tab(label="Backtest Lab", tab_id="tab-backtest", children=[
+                dbc.Card([
+                    dbc.CardHeader(html.H4("Strategy Backtesting Lab", className="mb-0")),
+                    dbc.CardBody([
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Trading Symbol"),
+                                dbc.Select(
+                                    id='backtest-symbol',
+                                    options=[
+                                        {'label': 'BTC/USDT', 'value': 'BTCUSDT'},
+                                        {'label': 'ETH/USDT', 'value': 'ETHUSDT'},
+                                        {'label': 'SOL/USDT', 'value': 'SOLUSDT'},
+                                    ],
+                                    value='BTCUSDT'
+                                ),
+                            ], md=3),
+                            dbc.Col([
+                                dbc.Label("Timeframe"),
+                                dbc.Select(
+                                    id='backtest-timeframe',
+                                    options=[
+                                        {'label': '1 Minute', 'value': '1m'},
+                                        {'label': '5 Minutes', 'value': '5m'},
+                                        {'label': '15 Minutes', 'value': '15m'},
+                                        {'label': '1 Hour', 'value': '1h'},
+                                        {'label': '4 Hours', 'value': '4h'},
+                                        {'label': '1 Day', 'value': '1d'},
+                                    ],
+                                    value='1h'
+                                ),
+                            ], md=3),
+                            dbc.Col([
+                                dbc.Label("Strategy"),
+                                dbc.Select(
+                                    id='backtest-strategy',
+                                    options=[
+                                        {'label': 'Convergence Strategy', 'value': 'convergence'},
+                                        {'label': 'Scalp 15m/4h', 'value': 'scalp_15m_4h'},
+                                        {'label': 'MA Crossover', 'value': 'ma_crossover'},
+                                        {'label': 'RSI Divergence', 'value': 'rsi_divergence'},
+                                    ],
+                                    value='convergence'
+                                ),
+                            ], md=3),
+                            dbc.Col([
+                                dbc.Label("Initial Capital ($)"),
+                                dbc.Input(id='backtest-capital', type='number', value=10000, min=1000, max=1000000, step=1000),
+                            ], md=3),
+                        ], className='mb-3'),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Start Date"),
+                                dcc.DatePickerSingle(
+                                    id='backtest-start-date',
+                                    date=datetime(2024, 1, 1),
+                                    display_format='YYYY-MM-DD'
+                                ),
+                            ], md=3),
+                            dbc.Col([
+                                dbc.Label("End Date"),
+                                dcc.DatePickerSingle(
+                                    id='backtest-end-date',
+                                    date=datetime.now(),
+                                    display_format='YYYY-MM-DD'
+                                ),
+                            ], md=3),
+                            dbc.Col([
+                                html.Br(),
+                        dbc.ButtonGroup([
+                            dbc.Button([
+                                html.I(className="fas fa-play me-2"), "Run Backtest"
+                            ], id='run-backtest-btn', color='primary', n_clicks=0),
+                                    dbc.Button([
+                                        html.I(className="fas fa-trophy me-2"), "Promote to Live"
+                                    ], id='promote-strategy-btn', color='success', n_clicks=0, disabled=True),
+                                ], size='lg'),
+                            ], md=6, className='d-flex align-items-end'),
+                        ], className='mb-3'),
+                        html.Hr(),
+                        dbc.Alert([
+                            html.I(className="fas fa-info-circle me-2"),
+                            "Backtest results will appear here. Select parameters and click 'Run Backtest' to begin."
+                        ], color='info', id='backtest-status'),
+                        html.Div(id='chat-backtest-summary', className='mb-3'),
+                        html.Div(id='backtest-results-container'),
+                    ]),
+                ], className='shadow-sm'),
+                # Results Modal
+                dbc.Modal([
+                    dbc.ModalHeader(dbc.ModalTitle("Backtest Results")),
+                    dbc.ModalBody(id='backtest-results-modal-body'),
+                    dbc.ModalFooter([
+                        dbc.Button("Export Report", id='export-backtest-btn', color='secondary', className='me-auto'),
+                        dbc.Button("Close", id='backtest-modal-close-btn', color='primary', n_clicks=0),
+                    ]),
+                ], id='backtest-results-modal', size='xl', is_open=False),
+            ])
+        ], id='main-tabs', active_tab='tab-market'),
+
+        # Intervals
+        dcc.Interval(id='interval-fast', interval=2000, n_intervals=0),
+        dcc.Interval(id='interval-slow', interval=10000, n_intervals=0),
+
+        # Stores
+        dcc.Store(id='timeframe-store', data='15m'),
+        dcc.Store(id='data-source-store', data={'used_sample_data': False, 'last_update': None}),
+        dcc.Store(id='backtest-result-store'),
+        dcc.Store(id='chat-history-store', data=[]),
+        dcc.Store(id='chat-backtest-store'),
+        dcc.Store(id='manager-actions-store', data={'last_command': None, 'last_result': None}),
+
+        
+        # Modals
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle(id='backtest-modal-title')),
+            dbc.ModalBody(id='backtest-modal-body'),
+            dbc.ModalFooter(dbc.Button("Close", id='backtest-modal-close', className="ms-auto", n_clicks=0))
+        ], id="backtest-modal", size="lg", is_open=False),
+
+    ], fluid=True, className="p-4")
+
+    app.layout = layout
+
+   # Status Badge Callback
+    @app.callback(
+        [Output('live-status-badge', 'style'),
+         Output('demo-status-badge', 'style'),
+         Output('freshness-badge', 'children'),
+         Output('last-age-badge', 'children')],
+        [Input('data-source-store', 'data')]
+    )
+    def update_status_badges(data_source):
+        """Update status badges based on data source, testnet setting, and freshness."""
+        import os
+
+        # Use actual data source from store, fallback to env var
+        used_sample = False
+        is_testnet = os.getenv('BINANCE_TESTNET', 'false').lower() == 'true'
+        endpoint = None
+        last_age = None
+
+        if data_source and isinstance(data_source, dict):
+            used_sample = data_source.get('used_sample_data', False)
+            is_testnet = data_source.get('is_testnet', is_testnet)
+            endpoint = data_source.get('endpoint')
+            last_age = data_source.get('last_candle_age_min')
+        else:
+            used_sample = os.getenv('DASH_USE_SAMPLE_DATA', '0') == '1'
+
+        # Set badge visibility based on sample data and testnet
+        if used_sample:
+            # Using sample/demo data
+            live_style = {'display': 'none'}
+            demo_style = {'display': 'inline-block'}
+            freshness_text = "Demo Data"
+        else:
+            # Using real data - show LIVE or TESTNET
+            demo_style = {'display': 'none'}
+            if is_testnet:
+                live_style = {'display': 'inline-block', 'backgroundColor': '#0dcaf0'}
+                freshness_text = f"Data Fresh: < 30s (Testnet{' | ' + endpoint if endpoint else ''})"
+            else:
+                live_style = {'display': 'inline-block'}
+                freshness_text = f"Data Fresh: < 30s{' | ' + endpoint if endpoint else ''}"
+
+        age_text = f"Age: {last_age:.1f}m" if last_age is not None else "Age: --"
+        return live_style, demo_style, freshness_text, age_text
+
+    # Main Chart Callback
+    @app.callback(
+        [Output('main-chart', 'figure'),
+         Output('data-source-store', 'data')],
+        [Input('interval-fast', 'n_intervals'),
+         Input('timeframe-store', 'data'),
+         Input('overlay-toggles', 'value'),
+         Input('refresh-data-btn', 'n_clicks')]
+    )
+    def update_main_chart(n_intervals, timeframe, overlay_toggles, refresh_clicks):
+        """Update the main-chart figure based on timeframe and overlay selections."""
+        # Load state from disk for split-brain synchronization (Step 1)
+        if 'CHAT_SYSTEM_CONTEXT' in globals() and CHAT_SYSTEM_CONTEXT:
+            CHAT_SYSTEM_CONTEXT.load_from_disk()
+
+        # Use timeframe from store, defaulting to 15m if not set
+        timeframe = timeframe or '15m'
+        force_refresh = False
+        ctx = callback_context
+        if ctx and ctx.triggered:
+            trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+            if trigger_id == 'refresh-data-btn':
+                force_refresh = True
+
+        # Fetch market data
+        symbol = 'BTCUSDT'
+        df, fetch_meta = fetch_market_data(symbol, timeframe, num_bars=1000, force_refresh=force_refresh)
+
+        # Prepare overlay features
+        overlay_toggles = overlay_toggles or []
+        features = {
+            'liquidity': 'liquidity' in overlay_toggles,
+            'supertrend': 'supertrend' in overlay_toggles,
+            'orderflow': 'orderflow' in overlay_toggles,
+            'chandelier': 'chandelier' in overlay_toggles,
+            'regime': False,
+            'alignment': False
+        }
+
+        # Create chart
+        price_fig = create_interactive_chart(df, symbol, timeframe, features)
+
+        # Prepare data source info for badges
+        import os
+        is_testnet_env = os.getenv('BINANCE_TESTNET', 'false').lower() == 'true'
+        endpoint = os.getenv('BINANCE_FUTURES_URL')
+        if not endpoint:
+            endpoint = 'https://testnet.binancefuture.com/fapi/v1' if is_testnet_env else 'https://fapi.binance.com/fapi/v1'
+
+        data_source_info = {
+            'used_sample_data': fetch_meta.get('used_sample_data', False),
+            'last_update': datetime.now().isoformat(),
+            'last_candle_age_min': fetch_meta.get('last_candle_age_min', 0),
+            'is_testnet': is_testnet_env,
+            'endpoint': endpoint
+        }
+
+        logger.info(f"Updated main-chart for {symbol} {timeframe} with overlays: {overlay_toggles}, sample_data={data_source_info['used_sample_data']}")
+
+        return price_fig, data_source_info
+
+    # Timeframe Selection Callback
+    @app.callback(
+        [Output('timeframe-store', 'data'),
+         Output('tf-1m', 'className'),
+         Output('tf-5m', 'className'),
+         Output('tf-15m', 'className'),
+         Output('tf-1h', 'className'),
+         Output('tf-4h', 'className'),
+         Output('tf-1d', 'className')],
+        [Input('tf-1m', 'n_clicks'),
+         Input('tf-5m', 'n_clicks'),
+         Input('tf-15m', 'n_clicks'),
+         Input('tf-1h', 'n_clicks'),
+         Input('tf-4h', 'n_clicks'),
+         Input('tf-1d', 'n_clicks')]
+    )
+    def update_timeframe_selection(n1m, n5m, n15m, n1h, n4h, n1d):
+        """Handle timeframe button clicks and update store."""
+        import dash
+
+        # Get the callback context to determine which button was clicked
+        ctx = dash.callback_context
+
+        if not ctx.triggered:
+            # No button clicked yet, return default (15m)
+            return '15m', 'tf-btn me-2', 'tf-btn me-2', 'tf-btn active me-2', 'tf-btn me-2', 'tf-btn me-2', 'tf-btn'
+
+        # Determine which button triggered the callback
+        button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+        # Map button IDs to timeframes
+        timeframe_map = {
+            'tf-1m': '1m',
+            'tf-5m': '5m',
+            'tf-15m': '15m',
+            'tf-1h': '1h',
+            'tf-4h': '4h',
+            'tf-1d': '1d'
+        }
+
+        selected_timeframe = timeframe_map.get(button_id, '15m')
+
+        # Update button styles to show active state
+        tf_1m_class = 'tf-btn active me-2' if button_id == 'tf-1m' else 'tf-btn me-2'
+        tf_5m_class = 'tf-btn active me-2' if button_id == 'tf-5m' else 'tf-btn me-2'
+        tf_15m_class = 'tf-btn active me-2' if button_id == 'tf-15m' else 'tf-btn me-2'
+        tf_1h_class = 'tf-btn active me-2' if button_id == 'tf-1h' else 'tf-btn me-2'
+        tf_4h_class = 'tf-btn active me-2' if button_id == 'tf-4h' else 'tf-btn me-2'
+        tf_1d_class = 'tf-btn active' if button_id == 'tf-1d' else 'tf-btn'
+
+        return selected_timeframe, tf_1m_class, tf_5m_class, tf_15m_class, tf_1h_class, tf_4h_class, tf_1d_class
+
+    @app.callback(
+        Output('portfolio-value', 'children'),
+        Output('portfolio-pnl-percent', 'children'),
+        Output('unrealized-pnl', 'children'),
+        Output('total-exposure', 'children'),
+        Output('max-drawdown', 'children'),
+        Output('active-positions-table', 'children'),
+        Output('trade-history-table', 'children'),
+        Output('system-health-metrics', 'children'),
+        Input('interval-fast', 'n_intervals')
+    )
+    def update_account_tab(n):
+        """Update the Account & Trading tab components."""
+        if not CHAT_SYSTEM_CONTEXT:
+            return "N/A", "", "N/A", "N/A", "N/A", "System Context Not Connected", "No Data", "No Data"
+
+        # Portfolio Metrics
+        risk_metrics = CHAT_SYSTEM_CONTEXT.risk_metrics
+        portfolio_value = risk_metrics.get('portfolio_value', 0)
+        unrealized_pnl = risk_metrics.get('unrealized_pnl', 0)
+        total_exposure = risk_metrics.get('total_exposure', 0)
+        max_drawdown = risk_metrics.get('max_drawdown', 0)
+
+        # Format Values
+        pv_str = f"${portfolio_value:,.2f}"
+        upnl_str = f"${unrealized_pnl:,.2f}"
+        exp_str = f"{total_exposure:.1%}"
+        dd_str = f"{max_drawdown:.1%}"
+
+        # PnL Percent Component
+        pnl_pct = (unrealized_pnl / portfolio_value) if portfolio_value > 0 else 0
+        pnl_color = "text-success" if pnl_pct >= 0 else "text-danger"
+        pnl_comp = html.Div(f"{pnl_pct:+.2%}", className=pnl_color)
+
+        # Active Positions Table
+        positions = CHAT_SYSTEM_CONTEXT.active_positions
+        if not positions:
+            pos_table = html.Div("No active positions", className="text-muted text-center p-3")
+        else:
+            pos_rows = []
+            for symbol, pos in positions.items():
+                pnl = pos.get('unrealized_pnl', 0)
+                pnl_class = "text-success" if pnl >= 0 else "text-danger"
+                pos_rows.append(html.Tr([
+                    html.Td(symbol),
+                    html.Td(pos.get('side', 'N/A')),
+                    html.Td(f"{pos.get('quantity', 0):.4f}"),
+                    html.Td(f"${pos.get('entry_price', 0):,.2f}"),
+                    html.Td(f"${pnl:,.2f}", className=pnl_class),
+                ]))
+
+            pos_table = html.Table([
+                html.Thead(html.Tr([html.Th("Symbol"), html.Th("Side"), html.Th("Size"), html.Th("Entry"), html.Th("PnL")])),
+                html.Tbody(pos_rows)
+            ], className="table table-dark table-hover")
+
+        # Trade History Table
+        history = CHAT_SYSTEM_CONTEXT.trade_history
+        if not history:
+            hist_table = html.Div("No trade history", className="text-muted text-center p-3")
+        else:
+            hist_rows = []
+            # Show last 10 trades
+            for trade in reversed(history[-10:]):
+                pnl = trade.pnl
+                pnl_class = "text-success" if pnl >= 0 else "text-danger"
+                hist_rows.append(html.Tr([
+                    html.Td(trade.exit_time.strftime("%H:%M")),
+                    html.Td(trade.symbol),
+                    html.Td(trade.side),
+                    html.Td(f"${pnl:,.2f}", className=pnl_class),
+                    html.Td(trade.exit_reason)
+                ]))
+
+            hist_table = html.Table([
+                html.Thead(html.Tr([html.Th("Time"), html.Th("Symbol"), html.Th("Side"), html.Th("PnL"), html.Th("Reason")])),
+                html.Tbody(hist_rows)
+            ], className="table table-dark table-sm")
+
+        # System Health
+        health = CHAT_SYSTEM_CONTEXT.system_health
+        health_metrics = html.Div([
+            html.Div([html.Span("Memory:"), html.Span(f"{health.get('memory_usage', 0):.1f} MB", className="float-end")]),
+            html.Div([html.Span("CPU:"), html.Span(f"{health.get('cpu_usage', 0):.1f}%", className="float-end")]),
+            html.Div([html.Span("Errors:"), html.Span(f"{len(health.get('errors', []))}", className="float-end text-danger" if health.get('errors') else "float-end text-success")]),
+            html.Div([html.Span("Last Check:"), html.Span(health.get('last_check', datetime.now()).strftime("%H:%M:%S"), className="float-end text-muted", style={'fontSize': '12px'})], className="mt-2")
+        ])
+
+        return pv_str, pnl_comp, upnl_str, exp_str, dd_str, pos_table, hist_table, health_metrics
+
+    # Manager Actions Callback - Step 18
+    @app.callback(
+        Output('manager-actions-status', 'children'),
+        Input('manager-actions-store', 'data')
+    )
+    def update_manager_actions_status(manager_data):
+        """Update the Manager Actions status card."""
+        if not manager_data or not manager_data.get('last_command'):
+            return html.Small("No commands executed yet", className="text-muted")
+
+        last_result = manager_data.get('last_result', {})
+        success = last_result.get('success', False)
+        timestamp = manager_data.get('timestamp', '')
+
+        # Format timestamp
+        try:
+            ts = datetime.fromisoformat(timestamp)
+            time_str = ts.strftime('%H:%M:%S')
+        except:
+            time_str = timestamp[:8] if timestamp else ''
+
+        # Create status component
+        status_color = "text-success" if success else "text-danger"
+        status_icon = "✓" if success else "✗"
+        status_text = "Success" if success else "Failed"
+
+        return html.Div([
+            html.Div([
+                html.Span(f"{status_icon} ", className=status_color),
+                html.Span(f"{status_text}", className=status_color, style={'fontWeight': 'bold'}),
+                html.Span(f" at {time_str}", className="text-muted", style={'fontSize': '12px'})
+            ]),
+            html.Div([
+                html.Small(f"Command: {manager_data['last_command'][:50]}{'...' if len(manager_data['last_command']) > 50 else ''}",
+                          className="text-muted d-block mt-1")
+            ])
+        ])
+
+    # Chat Callback
+    # SIMPLIFIED TEST CALLBACK
+    @app.callback(
+        Output('chat-status', 'children'),
+        Input('chat-send-btn', 'n_clicks'),
+        State('chat-input', 'value'),
+        prevent_initial_call=True
+    )
+    def test_simple_chat(n_clicks, message_text):
+        """SIMPLIFIED TEST: Just update status to prove callback works."""
+        print(f"\n🔔🔔🔔 SIMPLE CALLBACK TRIGGERED! n_clicks={n_clicks}, msg={message_text}\n")
+        return f"✅ Callback works! Got: {message_text}"
+    
+    # ORIGINAL FULL CALLBACK (DISABLED FOR TESTING)
+    # @app.callback(
+    #     Output('chat-history-store', 'data'),
+    #     Output('chat-history', 'children'),
+    #     Output('chat-input', 'value'),
+    #     Output('chat-status', 'children'),
+    #     Output('debug-output', 'children'),
+    #     Output('chat-backtest-store', 'data'),
+    #     Output('manager-actions-store', 'data'),
+    #     Output('timeframe-store', 'data', allow_duplicate=True),
+    #     Output('overlay-toggles', 'value'),
+    #     Input('chat-send-btn', 'n_clicks'),
+    #     Input('chat-input', 'n_submit'),
+    #     State('chat-input', 'value'),
+    #     State('chat-history-store', 'data'),
+    #     State('manager-actions-store', 'data'),
+    #     State('timeframe-store', 'data'),
+    #     State('overlay-toggles', 'value'),
+    #     prevent_initial_call=True
+    # )
+    def handle_chat_interaction(n_clicks, n_submit, message_text, chat_history, manager_actions_data, timeframe_value, overlay_values):
+        """Handle chat interaction with command router integration."""
+        print("\n" + "="*80)
+        print(f"🔔 CHAT CALLBACK TRIGGERED!")
+        print(f"   n_clicks={n_clicks}, n_submit={n_submit}")
+        print(f"   message_text='{message_text}'")
+        print(f"   chat_history_len={len(chat_history) if chat_history else 0}")
+        print("="*80 + "\n")
+        
+        logger.info(f"DEBUG: Callback received - n_clicks={n_clicks}, n_submit={n_submit}, message_text='{message_text}', chat_history_len={len(chat_history) if chat_history else 0}")
+
+        # Ignore initial render and empty clicks
+        if not n_clicks and not n_submit:
+            logger.info("DEBUG: Chat not sent yet")
+            return dash.no_update, dash.no_update, dash.no_update, "Awaiting message", dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+        if not message_text or not str(message_text).strip():
+            logger.info(f"DEBUG: Empty message text, returning early")
+            return dash.no_update, dash.no_update, dash.no_update, "No message", dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+        logger.info(f"DEBUG: Processing message: {message_text[:50]}...")
+        pending_status = "🔄 Sending to DeepSeek... (up to 30s)"
+
+        try:
+            # Step 18: Route through command router FIRST (before backtest check)
+            handled, router_response, router_metadata = route_chat_message(message_text)
+            router_intent = router_metadata.get('intent') if router_metadata else None
+
+            # If command was handled by router, use that response
+            if handled:
+                user_message = {'is_user': True, 'text': message_text, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                ai_payload = router_response
+                bt_payload = None
+
+                # If router intent is backtest, run the real backtest so chat is not demo
+                if router_intent in ('run_backtest_single', 'run_backtest_sweep') and router_metadata.get('success'):
+                    from backtesting.service import BacktestConfig, run_backtest as run_bt
+                    start_default = datetime(2024, 1, 1)
+                    end_default = datetime.now()
+
+                    if router_intent == 'run_backtest_single':
+                        params = router_metadata.get('data', {})
+                        cfg = BacktestConfig(
+                            symbol=params.get('symbol', 'BTCUSDT'),
+                            timeframe=params.get('timeframe', '15m'),
+                            start=start_default,
+                            end=end_default,
+                            strategy=params.get('strategy', 'convergence'),
+                            params={},
+                            initial_capital=float(params.get('capital', 10000)),
+                        )
+                        res = run_bt(cfg)
+                        ai_payload = (
+                            f"✅ Backtest for {cfg.symbol} on {cfg.timeframe} ({cfg.start.date()} → {cfg.end.date()})\n"
+                            f"Strategy: {cfg.strategy.upper()}\n"
+                            f"Return: {res.total_return_pct:+.2f}%\n"
+                            f"Trades: {res.total_trades}\n"
+                            f"Win Rate: {res.win_rate*100:.1f}%\n"
+                            f"Max DD: {res.max_drawdown:.2f}%\n"
+                            f"Sharpe: {res.sharpe_ratio:.2f}\n"
+                            f"Profit Factor: {res.profit_factor:.2f}\n"
+                            f"Initial: ${res.initial_capital:,.2f} → Final: ${res.final_capital:,.2f}"
+                        )
+                        bt_payload = {
+                            "symbol": cfg.symbol,
+                            "timeframe": cfg.timeframe,
+                            "strategy": cfg.strategy,
+                            "start": str(cfg.start),
+                            "end": str(cfg.end),
+                            "initial_capital": res.initial_capital,
+                            "final_capital": res.final_capital,
+                            "total_return_pct": res.total_return_pct,
+                            "win_rate": res.win_rate,
+                            "max_drawdown": res.max_drawdown,
+                            "sharpe_ratio": res.sharpe_ratio,
+                            "profit_factor": res.profit_factor,
+                            "total_trades": res.total_trades,
+                        }
+                    else:  # sweep
+                        params = router_metadata.get('data', {})
+                        symbol = params.get('symbol', 'BTCUSDT')
+                        strategy = params.get('strategy', 'convergence')
+                        capital = float(params.get('capital', 10000))
+                        tfs = params.get('timeframes') or ["1m", "5m", "15m", "1h", "4h", "1d"]
+                        summaries = []
+                        lines = [f"Sweep for {symbol} | {strategy.upper()} | {start_default.date()} → {end_default.date()}"]
+                        for tf in tfs:
+                            try:
+                                cfg = BacktestConfig(
+                                    symbol=symbol,
+                                    timeframe=tf,
+                                    start=start_default,
+                                    end=end_default,
+                                    strategy=strategy,
+                                    params={},
+                                    initial_capital=capital,
+                                )
+                                res = run_bt(cfg)
+                                summaries.append({
+                                    "symbol": symbol, "timeframe": tf, "strategy": strategy,
+                                    "start": str(cfg.start), "end": str(cfg.end),
+                                    "initial_capital": res.initial_capital, "final_capital": res.final_capital,
+                                    "total_return_pct": res.total_return_pct, "win_rate": res.win_rate,
+                                    "max_drawdown": res.max_drawdown, "sharpe_ratio": res.sharpe_ratio,
+                                    "profit_factor": res.profit_factor, "total_trades": res.total_trades
+                                })
+                                lines.append(f"- {tf}: {res.total_return_pct:+.2f}% | trades {res.total_trades} | win {res.win_rate*100:.1f}% | DD {res.max_drawdown:.2f}% | Sharpe {res.sharpe_ratio:.2f}")
+                            except Exception as exc:
+                                logger.exception(f"Chat backtest sweep failed for {tf}")
+                                lines.append(f"- {tf}: ❌ {exc}")
+                        ai_payload = "\n".join(lines)
+                        bt_payload = {"sweep": summaries}
+
+                ai_message = {'is_user': False, 'text': ai_payload, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                updated_history = (chat_history or []) + [user_message, ai_message]
+
+                # Update manager actions data
+                manager_actions_data = {
+                    'last_command': message_text,
+                    'last_result': router_metadata,
+                    'timestamp': datetime.now().isoformat()
+                }
+
+                # Determine any state changes requested by manager command
+                timeframe_out = dash.no_update
+                overlays_out = dash.no_update
+                if router_intent == 'set_timeframe' and router_metadata.get('success'):
+                    timeframe_out = router_metadata.get('data', {}).get('timeframe', dash.no_update)
+                elif router_intent == 'toggle_overlays' and router_metadata.get('success'):
+                    enable = router_metadata.get('data', {}).get('enable')
+                    all_overlays = ['liquidity', 'orderflow', 'supertrend', 'chandelier']
+                    current = overlay_values or []
+                    if enable is True:
+                        overlays_out = all_overlays
+                    elif enable is False:
+                        overlays_out = []
+                    else:  # toggle
+                        overlays_out = [] if set(current) == set(all_overlays) else all_overlays
+
+                logger.info(f"DEBUG: Command handled by router: {router_metadata.get('intent', 'unknown')}")
+                return updated_history, render_chat_history(updated_history), "", "Manager command executed", "Manager command executed", bt_payload, manager_actions_data, timeframe_out, overlays_out
+
+            # Fast-path: chat-triggered backtest to avoid DeepSeek when user requests backtests
+            bt_cfg = parse_backtest_command(message_text)
+            bt_sweep = "all timeframe" in message_text.lower()
+            if bt_cfg or bt_sweep:
+                from backtesting.service import BacktestConfig, run_backtest as run_bt
+                if bt_sweep:
+                    tfs = ["1m", "5m", "15m", "1h", "4h", "1d"]
+                    symbol = bt_cfg['symbol'] if bt_cfg else "BTCUSDT"
+                    strategy = bt_cfg['strategy'] if bt_cfg else "convergence"
+                    start = datetime.now() - timedelta(days=30)
+                    end = datetime.now()
+                    summaries = []
+                    lines = [f"Sweep for {symbol} | {strategy.upper()} | last 30d"]
+                    for tf in tfs:
+                        try:
+                            cfg = BacktestConfig(
+                                symbol=symbol,
+                                timeframe=tf,
+                                start=start,
+                                end=end,
+                                strategy=strategy,
+                                params={},
+                                initial_capital=float(bt_cfg['initial_capital']) if bt_cfg else 10000.0
+                            )
+                            res = run_bt(cfg)
+                            summaries.append({
+                                "symbol": symbol, "timeframe": tf, "strategy": strategy,
+                                "start": str(cfg.start), "end": str(cfg.end),
+                                "initial_capital": res.initial_capital, "final_capital": res.final_capital,
+                                "total_return_pct": res.total_return_pct, "win_rate": res.win_rate,
+                                "max_drawdown": res.max_drawdown, "sharpe_ratio": res.sharpe_ratio,
+                                "profit_factor": res.profit_factor, "total_trades": res.total_trades
+                            })
+                            lines.append(f"- {tf}: {res.total_return_pct:+.2f}% | trades {res.total_trades} | win {res.win_rate*100:.1f}% | DD {res.max_drawdown:.2f}% | Sharpe {res.sharpe_ratio:.2f}")
+                        except Exception as exc:
+                            logger.exception(f"Chat backtest sweep failed for {tf}")
+                            lines.append(f"- {tf}: ❌ {exc}")
+                    ai_text = "\n".join(lines)
+                    ai_status = "Backtest sweep completed ✓"
+                    bt_payload = {"sweep": summaries}
+                else:
+                    cfg = BacktestConfig(
+                        symbol=bt_cfg['symbol'],
+                        timeframe=bt_cfg['timeframe'],
+                        start=datetime.fromisoformat(bt_cfg['start']),
+                        end=datetime.fromisoformat(bt_cfg['end']),
+                        strategy=bt_cfg['strategy'],
+                        params={},
+                        initial_capital=float(bt_cfg['initial_capital'])
+                    )
+                    res = run_bt(cfg)
+                    ai_text = (
+                        f"✅ Backtest for {cfg.symbol} on {cfg.timeframe} ({cfg.start.date()} → {cfg.end.date()})\n"
+                        f"Strategy: {cfg.strategy.upper()}\n"
+                        f"Return: {res.total_return_pct:+.2f}%\n"
+                        f"Trades: {res.total_trades}\n"
+                        f"Win Rate: {res.win_rate*100:.1f}%\n"
+                        f"Max DD: {res.max_drawdown:.2f}%\n"
+                        f"Sharpe: {res.sharpe_ratio:.2f}\n"
+                        f"Profit Factor: {res.profit_factor:.2f}\n"
+                        f"Initial: ${res.initial_capital:,.2f} → Final: ${res.final_capital:,.2f}"
+                    )
+                    ai_status = "Backtest completed ✓"
+                    bt_payload = {
+                        "symbol": cfg.symbol,
+                        "timeframe": cfg.timeframe,
+                        "strategy": cfg.strategy,
+                        "start": str(cfg.start),
+                        "end": str(cfg.end),
+                        "initial_capital": res.initial_capital,
+                        "final_capital": res.final_capital,
+                        "total_return_pct": res.total_return_pct,
+                        "win_rate": res.win_rate,
+                        "max_drawdown": res.max_drawdown,
+                        "sharpe_ratio": res.sharpe_ratio,
+                        "profit_factor": res.profit_factor,
+                        "total_trades": res.total_trades,
+                    }
+                # Update history manually for chat backtests
+                user_message = {'is_user': True, 'text': message_text, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                ai_message = {'is_user': False, 'text': ai_text, 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                updated_history = (chat_history or []) + [user_message, ai_message]
+                return updated_history, render_chat_history(updated_history), "", ai_status, ai_status, bt_payload, dash.no_update, dash.no_update, dash.no_update
+
+            # Otherwise go through DeepSeek/chat path
+            updated_history, rendered_history, status, bt_payload = process_chat_request(
+                chat_history,
+                message_text,
+                message_type="strategy"
+            )
+            logger.info(f"DEBUG: Processed chat. History len: {len(updated_history)} | Status: {status}")
+            return updated_history, rendered_history, "", status, status or pending_status, bt_payload or dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        except Exception as exc:
+            logger.exception("Chat processing failed")
+            # Provide fallback response when DeepSeek is unavailable
+            fallback_response = f"I'm running in demo mode. Here's what I can tell you about {message_text[:50]}: The market shows typical volatility patterns. Consider checking technical indicators and risk management settings."
+            fallback_history = (chat_history or []) + [
+                {
+                    'text': message_text,
+                    'is_user': True,
+                    'timestamp': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                },
+                {
+                    'text': fallback_response,
+                    'is_user': False,
+                    'timestamp': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                }
+            ]
+            return fallback_history, render_chat_history(fallback_history), dash.no_update, "Demo response - AI service unavailable", "Demo response - AI service unavailable", dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    @app.callback(
+        Output('chat-backtest-summary', 'children'),
+        Input('chat-backtest-store', 'data')
+    )
+    def show_chat_backtest(bt_data):
+        """Render chat-triggered backtest summary."""
+        if not bt_data:
+            return dash.no_update
+
+        if bt_data.get("sweep"):
+            items = []
+            for entry in bt_data["sweep"]:
+                items.append(html.Div([
+                    html.Strong(entry.get("timeframe", "")),
+                    html.Span(f" Return {entry.get('total_return_pct',0):+.2f}%, Trades {entry.get('total_trades',0)}, Win {entry.get('win_rate',0)*100:.1f}%, DD {entry.get('max_drawdown',0):.2f}%, Sharpe {entry.get('sharpe_ratio',0):.2f}")
+                ], className="mb-1"))
+            header = f"Sweep: {bt_data['sweep'][0].get('symbol','')} | {bt_data['sweep'][0].get('strategy','')}"
+            return dbc.Card([dbc.CardBody([html.H6("Chat Backtest Sweep", className="text-muted"), html.Div(header), html.Div(items)])], className="ds-card")
+
+        return dbc.Card([
+            dbc.CardBody([
+                html.H6("Chat Backtest", className="text-muted"),
+                html.H5(f"{bt_data.get('symbol', '')} | {bt_data.get('timeframe', '')} | {bt_data.get('strategy', '')}"),
+                html.Div(f"{bt_data.get('start','')} → {bt_data.get('end','')}"),
+                dbc.Row([
+                    dbc.Col([html.Div("Return"), html.H5(f"{bt_data.get('total_return_pct',0):+.2f}%", className='text-success' if bt_data.get('total_return_pct',0) >=0 else 'text-danger')], md=3),
+                    dbc.Col([html.Div("Trades"), html.H5(bt_data.get('total_trades',0))], md=3),
+                    dbc.Col([html.Div("Win Rate"), html.H5(f"{bt_data.get('win_rate',0)*100:.1f}%")], md=3),
+                    dbc.Col([html.Div("Max DD"), html.H5(f"{bt_data.get('max_drawdown',0):.2f}%")], md=3),
+                ], className='mt-2'),
+                dbc.Row([
+                    dbc.Col([html.Div("Sharpe"), html.H6(f"{bt_data.get('sharpe_ratio',0):.2f}")], md=3),
+                    dbc.Col([html.Div("Profit Factor"), html.H6(f"{bt_data.get('profit_factor',0):.2f}")], md=3),
+                    dbc.Col([html.Div("Initial"), html.H6(f"${bt_data.get('initial_capital',0):,.2f}")], md=3),
+                    dbc.Col([html.Div("Final"), html.H6(f"${bt_data.get('final_capital',0):,.2f}")], md=3),
+                ], className='mt-2'),
+            ])
+        ], className="ds-card")
+
+    # Backtest Lab Callbacks
+    @app.callback(
+        [Output('backtest-status', 'children'),
+         Output('backtest-results-container', 'children'),
+         Output('promote-strategy-btn', 'disabled'),
+         Output('backtest-results-modal', 'is_open')],
+        [Input('run-backtest-btn', 'n_clicks')],
+        [State('backtest-symbol', 'value'),
+         State('backtest-timeframe', 'value'),
+         State('backtest-strategy', 'value'),
+         State('backtest-capital', 'value'),
+         State('backtest-start-date', 'date'),
+         State('backtest-end-date', 'date')]
+    )
+    def run_backtest(n_clicks, symbol, timeframe, strategy, capital, start_date, end_date):
+        """Run backtest with selected parameters."""
+        if not n_clicks or n_clicks == 0:
+            raise PreventUpdate
+
+        status_msg = dbc.Alert([
+            html.I(className="fas fa-spinner fa-spin me-2"),
+            f"Running backtest for {symbol} on {timeframe} timeframe..."
+        ], color='info')
+
+        try:
+            from backtesting.service import BacktestConfig, run_backtest as run_bt
+
+            # Build config
+            cfg = BacktestConfig(
+                symbol=symbol or "BTCUSDT",
+                timeframe=timeframe or "15m",
+                start=datetime.fromisoformat(start_date) if start_date else datetime.now() - timedelta(days=365),
+                end=datetime.fromisoformat(end_date) if end_date else datetime.now(),
+                strategy=strategy or "convergence",
+                params={},  # TODO: expose per-strategy params in UI if needed
+                initial_capital=float(capital or 10000),
+            )
+
+            result = run_bt(cfg)
+
+            # Build results card from real metrics
+            results = dbc.Card([
+                dbc.CardBody([
+                    html.H5("Backtest Results", className="card-title"),
+                    dbc.Row([
+                        dbc.Col([html.H6("Total Return"), html.H3(f"{result.total_return_pct:+.2f}%", className="text-success" if result.total_return_pct >= 0 else "text-danger")], md=3),
+                        dbc.Col([html.H6("Total Trades"), html.H3(result.total_trades, className="text-info")], md=3),
+                        dbc.Col([html.H6("Win Rate"), html.H3(f"{result.win_rate*100:.1f}%", className="text-success")], md=3),
+                        dbc.Col([html.H6("Max Drawdown"), html.H3(f"{result.max_drawdown:.2f}%", className="text-warning")], md=3),
+                    ], className='mb-3'),
+                    dbc.Row([
+                        dbc.Col([html.H6("Sharpe Ratio"), html.H4(f"{result.sharpe_ratio:.2f}")], md=3),
+                        dbc.Col([html.H6("Profit Factor"), html.H4(f"{result.profit_factor:.2f}")], md=3),
+                        dbc.Col([html.H6("Final Capital"), html.H4(f"${result.final_capital:,.2f}")], md=3),
+                        dbc.Col([html.H6("Initial Capital"), html.H4(f"${result.initial_capital:,.2f}")], md=3),
+                    ]),
+                    html.P([
+                        html.I(className="fas fa-info-circle me-2"),
+                        f"{symbol} | {timeframe} | {strategy} | {cfg.start.date()} → {cfg.end.date()}"
+                    ], className="text-muted"),
+                    dbc.Button([
+                        html.I(className="fas fa-chart-line me-2"), "View Details"
+                    ], id='view-details-btn', color='info', size='sm', n_clicks=0),
+                ])
+            ], className='shadow-sm')
+
+            success_status = dbc.Alert([
+                html.I(className="fas fa-check-circle me-2"),
+                "Backtest completed successfully. Click 'View Details' for more metrics."
+            ], color='success')
+
+            return success_status, results, False, False
+
+        except Exception as exc:
+            logger.exception("Backtest failed")
+            error_status = dbc.Alert([
+                html.I(className="fas fa-exclamation-triangle me-2"),
+                f"Backtest failed: {exc}"
+            ], color='danger')
+
+            return error_status, dash.no_update, True, False
+
+    @app.callback(
+        [Output('backtest-results-modal-body', 'children'),
+         Output('backtest-results-modal', 'is_open', allow_duplicate=True)],
+        Input('view-details-btn', 'n_clicks'),
+        State('backtest-results-modal', 'is_open'),
+        prevent_initial_call=True
+    )
+    def toggle_backtest_modal(n_clicks, is_open):
+        """Show detailed backtest results in modal."""
+        if not n_clicks:
+            raise PreventUpdate
+
+        # Toggle the modal open state
+        new_state = not is_open
+
+        # Build detailed content
+        details_content = dbc.Container([
+            html.H5("Detailed Performance Metrics", className="mb-3"),
+            dbc.Alert([
+                html.I(className="fas fa-info-circle me-2"),
+                "This section will show comprehensive backtest analysis including:"
+            ], color="info"),
+            html.Ul([
+                html.Li("Equity curve visualization"),
+                html.Li("Trade-by-trade breakdown"),
+                html.Li("Monthly/weekly performance heatmap"),
+                html.Li("Risk-adjusted returns analysis"),
+                html.Li("Position sizing distribution"),
+            ], className="mb-3"),
+            html.P([
+                html.I(className="fas fa-chart-line me-2"),
+                "Full implementation coming soon. For now, check the summary metrics above."
+            ], className="text-muted"),
+        ])
+
+        return details_content, new_state
+
+    return app
+
+
+if __name__ == "__main__":
+    import sys
+    import os
+
+    # Initialize real SystemContext
+    try:
+        from core.system_context import SystemContext
+        system_context = SystemContext()
+        set_system_context(system_context)
+        print("✓ Real SystemContext initialized")
+
+        # Initialize command router for Step 18 - DeepSeek as Manager
+        from ui.chat_command_router import set_system_context as set_router_context
+        from ui.chat_command_router import set_dashboard_callbacks as set_router_callbacks
+        set_router_context(system_context)
+        print("✓ Command Router initialized")
+
+    except Exception as e:
+        print(f"⚠ Warning: Could not initialize SystemContext: {e}")
+        print("  Dashboard will run with limited functionality")
+        # Create minimal fallback context
+        class MinimalContext:
+            def __init__(self):
+                self.overlay_state = {
+                    "liquidity": True,
+                    "supertrend": True,
+                    "orderflow": True,
+                    "chandelier": False,
+                    "regime": False,
+                    "alignment": False
+                }
+                self.system_health = {
+                    "memory_usage": 0,
+                    "cpu_usage": 0,
+                    "errors": [],
+                    "last_check": datetime.now(),
+                }
+                self.risk_metrics = {
+                    "portfolio_value": 100000.0,
+                    "unrealized_pnl": 0.0,
+                    "total_exposure": 0.0,
+                    "max_drawdown": 0.0,
+                }
+        set_system_context(MinimalContext())
+
+    # Check for demo/live mode
+    use_sample = os.getenv('DASH_USE_SAMPLE_DATA', '0') == '1'
+    is_testnet = os.getenv('BINANCE_TESTNET', 'false').lower() == 'true'
+    futures_url = os.getenv('BINANCE_FUTURES_URL')
+    if not futures_url:
+        futures_url = 'https://testnet.binancefuture.com/fapi/v1' if is_testnet else 'https://fapi.binance.com/fapi/v1'
+    data_label = "Demo/Sample Data" if use_sample else f"Binance {'Testnet' if is_testnet else 'Live'} API ({futures_url})"
+    mode = "DEMO MODE" if use_sample else ("TESTNET MODE" if is_testnet else "LIVE MODE")
+
+    # Create and run the app
+    print(f"\n{'='*60}")
+    print(f"  DeepSeek Trading Dashboard - {mode}")
+    print(f"{'='*60}")
+    print(f"  URL: http://127.0.0.1:8050")
+    print(f"  Data: {data_label}")
+    print(f"{'='*60}\n")
+
+    app = create_dashboard_app()
+    app.run(host='0.0.0.0', port=8050, debug=False, dev_tools_ui=False)

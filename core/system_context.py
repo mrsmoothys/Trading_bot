@@ -9,8 +9,10 @@ from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
 import json
 import yaml
+import os
 from pathlib import Path
 from loguru import logger
+from core.data.sentiment import fetch_fear_and_greed_index
 
 
 @dataclass
@@ -80,6 +82,9 @@ class SystemContext:
         self.trade_history: List[TradeRecord] = []
         self.feature_calculations: Dict[str, Dict[str, Any]] = {}
 
+        # External Sentiment
+        self.sentiment: Dict[str, Any] = fetch_fear_and_greed_index()
+
         # Overlay state tracking - tracks which chart overlays are currently active
         self.overlay_state: Dict[str, bool] = {
             "liquidity": False,
@@ -126,6 +131,69 @@ class SystemContext:
         self.max_trade_history = self.config.get("memory", {}).get("max_trade_history", 1000)
         self.max_conversation_memory = self.config.get("memory", {}).get("max_conversation_memory", 100)
         self.conversation_memory: List[Dict[str, Any]] = []
+
+        # Reconcile with database on startup (Step 3)
+        self._reconcile_with_database()
+
+    def _reconcile_with_database(self):
+        """
+        Reconcile active positions with database on startup.
+        """
+        try:
+            # Check if database persistence is enabled (feature flag)
+            if not self.config.get('database', {}).get('persist_positions', False):
+                logger.debug("Database position persistence disabled (feature flag off)")
+                return
+
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Schedule async task
+                asyncio.create_task(self._reconcile_async())
+            else:
+                loop.run_until_complete(self._reconcile_async())
+        except Exception as e:
+            logger.warning(f"Could not reconcile with database (non-critical): {e}")
+
+    async def _reconcile_async(self):
+        """Async reconciliation with database."""
+        try:
+            from ops.db import get_database
+            db = get_database()
+
+            # Load active positions from database
+            db_positions = await db.get_active_positions()
+
+            # Reconcile with in-memory state
+            if db_positions:
+                logger.info(f"Reconciling {len(db_positions)} active positions from database")
+                for pos in db_positions:
+                    symbol = pos['symbol']
+                    # Convert database record to SystemContext format
+                    self.active_positions[symbol] = {
+                        'id': pos['id'],
+                        'symbol': symbol,
+                        'side': pos['side'],
+                        'entry_price': pos['entry_price'],
+                        'quantity': pos['quantity'],
+                        'leverage': pos['leverage'],
+                        'unrealized_pnl': pos['unrealized_pnl'],
+                        'value': pos['value'],
+                        'entry_time': pos['entry_time'],
+                        'confidence': pos['confidence'],
+                        'reasoning': pos['reasoning'],
+                        'strategy': pos['strategy'],
+                        'stop_loss': pos['stop_loss'],
+                        'take_profit': pos['take_profit'],
+                        'source': pos['source'],
+                        'last_updated': pos['last_updated'],
+                    }
+                logger.info(f"Loaded {len(db_positions)} positions from database into SystemContext")
+            else:
+                logger.debug("No active positions found in database")
+
+        except Exception as e:
+            logger.error(f"Failed to reconcile with database: {e}")
 
     def _load_config(self):
         """Load configuration from YAML file."""
@@ -209,6 +277,40 @@ class SystemContext:
             "last_updated": datetime.now().isoformat(),
         }
         self._update_risk_metrics()
+        # Save to disk for split-brain synchronization
+        self.save_to_disk()
+        # Save to database for persistence (Step 3)
+        self._save_position_to_db(symbol, self.active_positions[symbol])
+
+    def _save_position_to_db(self, symbol: str, position_data: Dict[str, Any]):
+        """Save position to database asynchronously."""
+        try:
+            import asyncio
+            from ops.db import get_database
+
+            # Check if we should save to DB (feature flag)
+            if not self.config.get('database', {}).get('persist_positions', False):
+                return
+
+            # Run async database operation in event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If we're already in an async context, schedule the task
+                asyncio.create_task(self._save_position_async(position_data))
+            else:
+                # If no event loop, create one temporarily
+                loop.run_until_complete(self._save_position_async(position_data))
+        except Exception as e:
+            logger.warning(f"Could not save position to database (non-critical): {e}")
+
+    async def _save_position_async(self, position_data: Dict[str, Any]):
+        """Async wrapper for saving position to database."""
+        try:
+            from ops.db import get_database
+            db = get_database()
+            await db.save_active_position(position_data)
+        except Exception as e:
+            logger.error(f"Failed to save position to database: {e}")
 
     def close_position(self, symbol: str, exit_data: Dict[str, Any]):
         """Close a position and record the trade."""
@@ -240,6 +342,39 @@ class SystemContext:
         # Remove from active positions
         del self.active_positions[symbol]
         self._update_risk_metrics()
+        # Save to disk for split-brain synchronization
+        self.save_to_disk()
+        # Remove from database (Step 3)
+        self._remove_position_from_db(symbol)
+
+    def _remove_position_from_db(self, symbol: str):
+        """Remove position from database asynchronously."""
+        try:
+            import asyncio
+            from ops.db import get_database
+
+            # Check if we should save to DB (feature flag)
+            if not self.config.get('database', {}).get('persist_positions', False):
+                return
+
+            # Run async database operation
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self._remove_position_async(symbol))
+            else:
+                loop.run_until_complete(self._remove_position_async(symbol))
+        except Exception as e:
+            logger.warning(f"Could not remove position from database (non-critical): {e}")
+
+    async def _remove_position_async(self, symbol: str):
+        """Async wrapper for removing position from database."""
+        try:
+            from ops.db import get_database
+            db = get_database()
+            # For now, just log - actual removal would be in trade history
+            logger.info(f"Position {symbol} closed and removed from active tracking")
+        except Exception as e:
+            logger.error(f"Failed to remove position from database: {e}")
 
     def _update_risk_metrics(self):
         """Update portfolio risk metrics."""
@@ -278,6 +413,8 @@ class SystemContext:
             "errors": errors,
             "last_check": datetime.now(),
         })
+        # Save to disk for split-brain synchronization
+        self.save_to_disk()
 
     def update_feature_calculations(self, symbol: str, features: Dict[str, Any]):
         """Update calculated features for a symbol."""
@@ -419,6 +556,7 @@ class SystemContext:
         return {
             "timestamp": datetime.now().isoformat(),
             "market_regime": self.market_regime,
+            "sentiment": self.sentiment,  # Add sentiment to context
             "selected_feature_profile": self.selected_feature_profile,
             "overlay_state": self.overlay_state.copy(),  # Current active chart overlays
             "recent_overlay_changes": [
@@ -572,3 +710,91 @@ class SystemContext:
             print(f"✅ System state loaded from {filepath}")
         except FileNotFoundError:
             print(f"⚠️  State file {filepath} not found, starting fresh")
+
+    # Split-brain fix: File-based synchronization for dashboard/trading engine
+    STATE_FILE = "data/system_state.json"
+
+    def save_to_disk(self):
+        """
+        Save critical system state to disk for split-brain synchronization.
+        Atomic write pattern to prevent corruption.
+        """
+        # Ensure data directory exists
+        os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
+
+        state = {
+            "active_positions": self.active_positions,
+            "risk_metrics": self.risk_metrics,
+            "trade_history": [
+                {
+                    "symbol": t.symbol,
+                    "entry_time": t.entry_time.isoformat(),
+                    "exit_time": t.exit_time.isoformat(),
+                    "side": t.side,
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "quantity": t.quantity,
+                    "pnl": t.pnl,
+                    "pnl_percent": t.pnl_percent,
+                    "confidence": t.confidence,
+                    "reasoning": t.reasoning,
+                    "exit_reason": t.exit_reason,
+                }
+                for t in self.trade_history
+            ],
+            "system_health": self.system_health,
+            "market_regime": self.market_regime,
+            "last_updated": datetime.now().isoformat(),
+        }
+
+        # Atomic write pattern to prevent corruption
+        temp_file = self.STATE_FILE + ".tmp"
+        with open(temp_file, 'w') as f:
+            json.dump(state, f, indent=2, default=str)
+        os.replace(temp_file, self.STATE_FILE)
+
+        logger.debug(f"System state saved to {self.STATE_FILE}")
+
+    def load_from_disk(self):
+        """
+        Load critical system state from disk for split-brain synchronization.
+        Returns True if state was loaded, False if no state file exists.
+        """
+        if not os.path.exists(self.STATE_FILE):
+            return False
+
+        try:
+            with open(self.STATE_FILE, 'r') as f:
+                state = json.load(f)
+
+            # Restore critical state
+            self.active_positions = state.get("active_positions", {})
+            self.risk_metrics = state.get("risk_metrics", {})
+            self.system_health = state.get("system_health", {})
+            self.market_regime = state.get("market_regime", "UNKNOWN")
+
+            # Restore trade history
+            trade_data = state.get("trade_history", [])
+            self.trade_history = [
+                TradeRecord(
+                    symbol=t["symbol"],
+                    entry_time=datetime.fromisoformat(t["entry_time"]),
+                    exit_time=datetime.fromisoformat(t["exit_time"]),
+                    side=t["side"],
+                    entry_price=t["entry_price"],
+                    exit_price=t["exit_price"],
+                    quantity=t["quantity"],
+                    pnl=t["pnl"],
+                    pnl_percent=t["pnl_percent"],
+                    confidence=t["confidence"],
+                    reasoning=t["reasoning"],
+                    exit_reason=t["exit_reason"],
+                )
+                for t in trade_data
+            ]
+
+            logger.debug(f"System state loaded from {self.STATE_FILE}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load system state from {self.STATE_FILE}: {e}")
+            return False

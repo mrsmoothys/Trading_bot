@@ -1,117 +1,67 @@
 {
   "context": {
-    "project": "Trading Bot – Backtest Automation & Dashboard Redesign",
+    "project": "DeepSeek Dashboard Restoration",
+    "last_update": "2025-11-19",
     "owner": "Codex via VibeCoder",
-    "last_update": "2025-11-17",
-    "vision": "Enable backtests directly from the dashboard/DeepSeek chat and modernize the UI for high-performance trading operations."
+    "problem": "The UI rewrite stripped away most panels (trading controls, strategies, chat, telemetry) and callbacks. Current layout is a bare column that breaks functionality and looks outdated."
   },
-  "workstreams": [
+  "plan": [
     {
-      "id": "W1",
-      "title": "Dashboard-triggered Backtests",
-      "description": "Let operators or DeepSeek kick off backtests from the Dash UI/chat, consume the backtest service results, and display metrics inline.",
-      "milestones": [
-        {
-          "step": "W1.1",
-          "title": "Backtest Service Endpoint",
-          "detail": "Host the existing backtesting API (FastAPI or Typer runner) so the dashboard/chat can hit `/backtest` with a JSON payload and receive metrics.",
-          "code_example": "POST /backtest\\n{\\n  \"symbol\": \"BTCUSDT\",\\n  \"timeframe\": \"1h\",\\n  \"strategy\": \"sma\",\\n  \"start\": \"2024-01-01T00:00:00\",\\n  \"end\": \"2024-06-30T00:00:00\",\\n  \"params\": {\"fast_period\": 20, \"slow_period\": 50}\\n}",
-          "acceptance": [
-            "Endpoint returns BacktestResult JSON within 2s for sample configs.",
-            "Errors surfaced with HTTP 4xx/5xx and human-readable messages."
-          ]
-        },
-        {
-          "step": "W1.2",
-          "title": "Dashboard Backtest Panel",
-          "detail": "Add a UI panel (form + modal) letting users pick symbol/timeframe/strategy/params, call the backtest endpoint asynchronously, and render metrics/equity curve.",
-          "code_example": "dcc.Store(id='backtest-result-store')\\nhtml.Button('Run Backtest', id='run-backtest-btn')\\n@callback(Output('backtest-modal', 'is_open'), Input('run-backtest-btn', 'n_clicks'), State(...))",
-          "acceptance": [
-            "Button triggers a background task (Celery/thread) so UI stays responsive.",
-            "Modal shows PnL, Sharpe, drawdown, trade list, and chart preview."
-          ]
-        },
-        {
-          "step": "W1.3",
-          "title": "DeepSeek Chat Integration",
-          "detail": "Add a chat command (e.g., `run backtest symbol=BTCUSDT strategy=convergence params={...}`) that parses the request, calls the backtest endpoint, and returns the metrics in the AI response.",
-          "code_example": "if 'run backtest' in user_text: config = parse_config(user_text); result = call_backtest_api(config); ai_response = format_backtest_summary(result)",
-          "acceptance": [
-            "Chat responses include real metrics (not canned text).",
-            "Requests are logged in ExperimentStore with `source='chat'`."
-          ]
-        },
-        {
-          "step": "W1.4",
-          "title": "Experiment Logging & Promotion Hook",
-          "detail": "Any dashboard/chat-triggered backtest writes to `data/experiments.sqlite` and exposes a 'Promote this run' button that shells out to `scripts/promote_strategy.py`.",
-          "acceptance": [
-            "Runs are deduplicated via config hash.",
-            "Promotion button surfaces CLI output/errors in the UI."
-          ]
-        }
+      "id": "A1",
+      "title": "Audit & Component Trace",
+      "steps": [
+        "Enumerate every component used in callbacks: inspect `ui/dashboard.py` (all `@callback` outputs) and cross-check `dashboard_elements.json`, `DASHBOARD_VERIFICATION_REPORT.md` to confirm required IDs (e.g., `positions-table`, `metrics-cards`, `trading-status-text`, `convergence-status`, `scalp-status`, `chat-history`, `backtest-modal`).",
+        "Document which components currently exist in the DOM vs. missing, noting whether helper builders (e.g., `create_metrics_card`, `create_positions_table`) still exist."
+      ],
+      "acceptance": [
+        "Spreadsheet/markdown list mapping callbacks → element IDs → present/missing status.",
+        "No callback references an element that remains undefined."
       ]
     },
     {
-      "id": "W2",
-      "title": "Dashboard UI Redesign",
-      "description": "Refresh the styling, layout, and responsiveness of the Dash UI to feel modern (Dark Pro aesthetic) while improving performance.",
-      "research": [
-        "Review Dash best practices: leverage `dash-bootstrap-components`, CSS Grid/Flexbox, and lazy-loaded charts.",
-        "Audit existing layout – identify heavy components (Plotly figures with 3 subplots, large tables) causing lag.",
-        "Collect inspiration: Coinbase Pro, TradingView Dark, Binance Pro dashboards."
+      "id": "A2",
+      "title": "Rebuild Layout Structure",
+      "steps": [
+        "Restore the previous section hierarchy in `layout()`: top nav (symbol/price/timeframe buttons, start/stop controls, alerts), overlay toggles with refresh/emergency buttons, metrics cards grid, main chart stack (price + volume + orderflow), positions table, system health, feature metrics, convergence strategy panel, scalp strategy panel, alert manager, trading control buttons, feature profile buttons, backtest modal launcher/results, DeepSeek chat (history + input + quick actions).",
+        "Use `dbc.Container/Row/Col` or CSS Grid to create a two-column layout for desktop (`grid-template-columns: 2fr 1fr; gap: 24px`) that collapses to one column on tablets/mobile. Wrap each section in a card (`.ds-card`).",
+        "Ensure all `dcc.Store`, `dcc.Interval`, modals, and hidden divs required by callbacks are reinstated."
       ],
-      "milestones": [
-        {
-          "step": "W2.1",
-          "title": "Design System & Theme",
-          "detail": "Adopt a polished theme (e.g., `dbc.themes.DARKLY` or custom CSS based on Tailwind-inspired tokens). Define typography, colors, spacing, and reusable components (cards, panels, badges).",
-          "code_example": "app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY, '/assets/custom.css'])\\ncard = dbc.Card([...], className='ds-card shadow-sm')",
-          "acceptance": [
-            "All sections share consistent styling (cards, paddings, fonts).",
-            "Theme overrides live in `/assets/custom.css` with clear tokens."
-          ]
-        },
-        {
-          "step": "W2.2",
-          "title": "Layout Modernization",
-          "detail": "Refactor the layout using CSS Grid/Flexbox to ensure responsive behavior (two-column split on desktop, stacked on mobile). Group related widgets (charts, telemetry, strategies) into collapsible sections.",
-          "acceptance": [
-            "Layout adapts from ≥1200px (two columns) to ≤768px (stacked).",
-            "Sticky top nav with trading controls + status."
-          ]
-        },
-        {
-          "step": "W2.3",
-          "title": "Performance Enhancements",
-          "detail": "Use Plotly `uirevision`, memoized callbacks, and virtualization for large tables. Defer expensive updates (e.g., equity curves) to background tasks and show skeleton loaders.",
-          "code_example": "@callback(..., prevent_initial_call=True, memoize=True)",
-          "acceptance": [
-            "Interaction latency under 200 ms for toggles.",
-            "CPU usage reduced vs previous build during 5-minute run."
-          ]
-        },
-        {
-          "step": "W2.4",
-          "title": "UX Polish",
-          "detail": "Add micro-interactions: tooltips, status badges (success/warning), timeline of system messages, dark-mode typography, consistent iconography (FontAwesome).",
-          "acceptance": [
-            "Feature toggles show tooltips explaining impact.",
-            "System notifications (alert setup, backtest complete) appear as toasts/snackbars."
-          ]
-        }
+      "acceptance": [
+        "Every component listed in `dashboard_elements.json` renders with stable IDs.",
+        "Layout adapts responsively between ≥1200px (two columns) and ≤992px (stacked)."
+      ]
+    },
+    {
+      "id": "A3",
+      "title": "Reconnect Callbacks & Helpers",
+      "steps": [
+        "Verify each callback output returns valid children: reuse helper functions (`create_metrics_card`, `create_positions_table`, etc.) or add new ones for restored sections. Ensure buttons/stores (`refresh-btn`, `force-refresh-btn`, `setup-alerts-btn`, `chat-quick-*`) exist and have aria labels/tooltips.",
+        "Re-add missing decorators (e.g., `@callback(Output('chat-send-button','disabled'), ...)`) that were removed in the rewrite.",
+        "Confirm backtest promotion, alert setup, emergency stop, and feature profile toggles all point to the reinstated DOM nodes."
+      ],
+      "acceptance": [
+        "Dash server logs show no `MissingCallbackContext` or `Cannot read property` errors on load.",
+        "Interactions (start trading, toggle overlays, run convergence/scalp updates, chat send) behave as before."
+      ]
+    },
+    {
+      "id": "A4",
+      "title": "Testing & Verification",
+      "steps": [
+        "Launch the dashboard (`python -m ui.dashboard`) and verify visually (Chrome MCP snapshot) that all sections render with the restored design.",
+        "Add/update a smoke test (e.g., `tests/test_system_dashboard.py`) that calls `ui.dashboard.layout()` inside a Dash test app and asserts key IDs exist in the component tree.",
+        "Run existing test suites (`pytest tests/test_backtest_service.py tests/test_scalp_15m_4h.py`, plus the new smoke test) and `make lint` if feasible."
+      ],
+      "acceptance": [
+        "Dashboard screenshot shows fully populated UI.",
+        "New smoke test passes, ensuring layout integrity.",
+        "All pytest suites succeed."
       ]
     }
   ],
-  "verification": {
-    "tests": [
-      "pytest tests/test_backtest_service.py",
-      "Manual dashboard session: run a backtest via button + chat, inspect modal results."
-    ],
-    "success_criteria": [
-      "Backtests triggered from UI/chat produce real metrics stored in ExperimentStore.",
-      "Dashboard redesign meets responsiveness and performance targets (documented before/after).",
-      "DeepSeek recommendations reference actual backtest outputs."
-    ]
-  }
+  "notes": [
+    "Do not attempt stylistic polish until the functional layout is restored.",
+    "Use existing CSS tokens/classes in `assets/custom.css` (e.g., `.ds-card`, `.text-tertiary`).",
+    "Document any remaining UX polish tasks separately once functionality is back."
+  ]
 }
